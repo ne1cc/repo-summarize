@@ -4,6 +4,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+- Prompts require every diagram to be a fenced `mermaid` block (no ASCII or box-drawing art) with quoted punctuation labels, so diagrams render in Markdown viewers.
+
+### Added
+- Output post-pass that fences Mermaid the model left untagged, tagged `text`/`mmd`, tagged with the diagram keyword (e.g. ```` ```sequenceDiagram ````), or unfenced, as ```` ```mermaid ````. Code fences in real languages are untouched.
+
 ## [1.0.0] - 2026-10-03
 
 First public release, extracted from a private dotfiles repository where it was developed from 2026-09-18.
