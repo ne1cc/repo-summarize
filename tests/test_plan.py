@@ -162,6 +162,8 @@ def test_reuse_rules(rs):
     gb = rs.Graph(set(big_edges), set(), ["src/f0.py"], [], {})
     assert rs.plan_reusable(big_plan, big_meta, gb, big_files)
     assert not rs.plan_reusable(big_plan, big_meta, gb, big_files + ["newdir/x.py"])
+    assert not rs.plan_reusable(big_plan, big_meta, gb, big_files + ["bin/tool"])  # extensionless script dir
+    assert rs.top_dirs(["bin/tool", "src/a.py", ".github/ci.yml", "tests/test_a.py"]) == [".github", "bin", "src"]
     # edge jaccard distance 0.25: |A∩B|=75 of union 100
     old = {("e", str(i)) for i in range(75)} | {("o", str(i)) for i in range(25)}
     new = {("e", str(i)) for i in range(75)}

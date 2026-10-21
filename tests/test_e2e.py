@@ -168,7 +168,7 @@ def test_e2e_tool_denied_degrades_not_aborts(rs, tool):
     assert code == rs.EXIT_OK
     arch = repo / ARCH
     assert (arch / "INDEX.md").is_file()
-    assert calls.count("plan") == 3 and calls.count("chapter") >= 3
+    assert calls.count("plan") == 2 and calls.count("chapter") >= 3  # ask + tool re-ask; fallback covers scripts/, no attach re-ask
     index = (arch / "INDEX.md").read_text()  # fallback_plan titles, not BOOK_PLAN's "Main flow"
     assert "The main flow" in index and "Main flow" not in index and "Core" not in index
     unc = (arch / "UNCERTAINTIES.md").read_text()
