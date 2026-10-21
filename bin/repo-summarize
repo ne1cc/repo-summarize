@@ -617,6 +617,8 @@ def extract_json(reply: str):
             return json.loads(block)
         except ValueError:
             continue
+        except RecursionError:  # drop it so the scan below doesn't trip on it too
+            reply = reply.replace(block, "")
     dec, best, skip = json.JSONDecoder(), None, 0
     for m in re.finditer(r"[{\[]", reply):
         if m.start() < skip:  # nested inside an already decoded value

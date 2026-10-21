@@ -136,3 +136,8 @@ def test_extract_json_nested_is_fast(rs):
     t = time.perf_counter()
     assert rs.extract_json("[" * 500 + "]" * 500 + "x" * 30000)  # nested within limits: one decode
     assert time.perf_counter() - t < 1
+
+
+def test_extract_json_deep_fenced_block(rs):
+    deep = "[" * 16000 + "]" * 16000
+    assert rs.extract_json(f"```json\n{deep}\n```\nActually: {{\"a\":1}}") == {"a": 1}
