@@ -10,8 +10,10 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -193,6 +195,227 @@ def changed_since_snapshot(disc: Discovery, snap: Snapshot) -> list[str]:
         except OSError:
             return None
     return sorted(rel for rel in disc.included if sha(rel) != snap.sha256.get(rel))
+
+
+# --- graph ------------------------------------------------------------------
+
+Q = r"""['"]"""
+IMPORT_RES = {
+    "py": [re.compile(r"^\s*from\s+([._\w]+)\s+import"), re.compile(r"^\s*import\s+([._\w]+)")],
+    "js": [re.compile(rf"(?:from|require\(|import\()\s*{Q}([^'\"]+){Q}"), re.compile(rf"^\s*import\s+{Q}([^'\"]+){Q}")],
+    "lua": [re.compile(rf"require\s*\(?\s*{Q}([^'\"]+){Q}")],
+    "sh": [re.compile(rf"^\s*(?:source|\.)\s+{Q}?([^'\" ;]+)")],
+    "c": [re.compile(r'^\s*#\s*include\s*"([^"]+)"')],
+}
+LANG_OF = {"py": "py", "js": "js", "jsx": "js", "ts": "js", "tsx": "js", "lua": "lua", "sh": "sh", "zsh": "sh",
+           "c": "c", "h": "c", "cpp": "c", "hpp": "c"}
+COMMENT = {"py": ("#",), "sh": ("#",), "lua": ("--",), "js": ("//", "/*", "*"), "c": ("//", "/*", "*")}
+CONFIG_EXTS = {".yml", ".yaml", ".toml", ".json", ".properties", ".ini", ".cfg"}
+ENTRY_NAMES = {"main", "app", "index", "server", "cli", "__main__"}
+
+
+@dataclass
+class Graph:
+    edges: set[tuple[str, str]]
+    shims: set[str]
+    entry_points: list[str]
+    unsupported_langs: list[str]
+    fan_in: dict[str, int]
+
+
+def _lang(path: str) -> str | None:
+    return LANG_OF.get(path.rpartition(".")[2])
+
+
+def _specs(lang: str, line: str) -> list[str]:
+    return [m[1] for rx in IMPORT_RES[lang] if (m := rx.search(line))]
+
+
+def _norm(p: str) -> str:
+    out: list[str] = []
+    for part in p.split("/"):
+        if part == "..":
+            out and out.pop()
+        elif part not in ("", "."):
+            out.append(part)
+    return "/".join(out)
+
+
+def _dir(p: str) -> str:
+    return p.rpartition("/")[0]
+
+
+def _resolver(files: list[str]):
+    exact: dict[str, str] = {}
+    suffix: dict[str, str] = {}
+    amb: set[str] = set()
+
+    def add(key: str, p: str) -> None:
+        exact.setdefault(key, p)
+        parts = key.split("/")
+        for i in range(len(parts) - 1, -1, -1):
+            s = "/".join(parts[i:])
+            if suffix.get(s, p) != p:
+                amb.add(s)
+            else:
+                suffix[s] = p
+
+    for p in files:
+        noext = re.sub(r"\.[^./]+$", "", p)
+        add(noext, p)
+        add(p, p)
+        if re.search(r"(^|/)(index|__init__|init|mod)$", noext):
+            d = re.sub(r"/?(index|__init__|init|mod)$", "", noext)
+            if d:
+                add(d, p)
+
+    def uniq(key: str) -> str | None:
+        return suffix[key] if key in suffix and key not in amb else None
+
+    def resolve(f: str, spec: str) -> str | None:
+        ext = f.rpartition(".")[2]
+        if re.match(r"\.\.?/", spec):
+            return exact.get(_norm(_dir(f) + "/" + spec))
+        if ext == "py" and spec.startswith("."):
+            rest = spec.lstrip(".")
+            if not rest:
+                return None
+            base = _dir(f)
+            for _ in range(len(spec) - len(rest) - 1):
+                base = _dir(base)
+            return exact.get(_norm(base + "/" + rest.replace(".", "/")))
+        if ext in ("py", "lua"):
+            return uniq(spec.replace(".", "/"))
+        if LANG_OF.get(ext) == "js":
+            return uniq(spec[2:]) if re.match(r"[@~]/", spec) else None
+        return uniq(spec.rsplit("/", 1)[-1] if "$" in spec else spec)
+
+    return resolve
+
+
+def _is_shim(lang: str, lines: list[str]) -> bool:
+    body = [s for ln in lines if (s := ln.strip()) and not s.startswith(COMMENT[lang])]
+    imports = sum(bool(_specs(lang, s)) for s in body)
+    return imports > 0 and imports / len(body) >= SHIM_RATIO
+
+
+def _toml(snap: Snapshot, path: str, included: list[str]) -> dict:
+    try:
+        return tomllib.loads("\n".join(read_snapshot(snap, path))) if path in included else {}
+    except (tomllib.TOMLDecodeError, OSError):
+        return {}
+
+
+def _json(snap: Snapshot, path: str, included: list[str]) -> dict:
+    try:
+        data = json.loads("\n".join(read_snapshot(snap, path))) if path in included else {}
+    except (ValueError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _entry_points(snap: Snapshot, included: list[str]) -> list[str]:
+    inc, found = set(included), set()
+    for p in included:
+        name, _, ext = Path(p).name.rpartition(".")
+        if name in ENTRY_NAMES and f".{ext}" in CODE_EXTS:
+            found.add(p)
+    scripts = _toml(snap, "pyproject.toml", included).get("project", {}).get("scripts", {})
+    for target in scripts.values() if isinstance(scripts, dict) else []:
+        mod = str(target).split(":")[0].strip().replace(".", "/")
+        found.update(c for c in (f"{mod}.py", f"src/{mod}.py", f"{mod}/__init__.py", f"src/{mod}/__init__.py")
+                     if c in inc)
+    bins = _json(snap, "package.json", included).get("bin", {})
+    for b in [bins] if isinstance(bins, str) else bins.values() if isinstance(bins, dict) else []:
+        found.update({_norm(str(b))} & inc)
+    for p in included:
+        if not Path(p).name.startswith("Dockerfile"):
+            continue
+        for line in read_snapshot(snap, p):
+            m = re.match(r"\s*(?:CMD|ENTRYPOINT)\s+(.*)", line, re.I)
+            if not m:
+                continue
+            try:
+                args = json.loads(m[1]) if m[1].lstrip().startswith("[") else shlex.split(m[1])
+            except ValueError:
+                continue
+            found.update(next(({_norm(str(a))} & inc for a in args if _norm(str(a)) in inc), set()))
+    return sorted(found)
+
+
+def build_graph(snap: Snapshot, included: list[str]) -> Graph:
+    resolve = _resolver(included)
+    base: dict[str, set[str]] = {}
+    shims: set[str] = set()
+    for f in included:
+        if not (lang := _lang(f)):
+            continue
+        lines = read_snapshot(snap, f)
+        if _is_shim(lang, lines):
+            shims.add(f)
+        for ln in lines:
+            for spec in _specs(lang, ln):
+                if (t := resolve(f, spec)) and t != f:
+                    base.setdefault(f, set()).add(t)
+    edges = {(a, t) for a, ts in base.items() for t in ts}
+    edges |= {(a, t) for a, s in edges if s in shims for t in base.get(s, ()) if t != a}
+    fan_in: dict[str, int] = {}
+    for _, t in edges:
+        fan_in[t] = fan_in.get(t, 0) + 1
+    exts = {Path(f).suffix for f in included} & CODE_EXTS - CONFIG_EXTS
+    unsupported = sorted(e[1:] for e in exts if e[1:] not in LANG_OF)
+    return Graph(edges, shims, _entry_points(snap, included), unsupported, fan_in)
+
+
+def _workflow_runs(lines: list[str]) -> list[str]:
+    out, i = [], 0
+    while i < len(lines):
+        m = re.match(r"(\s*(?:-\s+)?)run:\s*(.*)$", lines[i])
+        i += 1
+        if not m:
+            continue
+        val = m[2].strip()
+        if re.fullmatch(r"[|>][+-]?", val):
+            indent = len(m[1])
+            while i < len(lines) and (not lines[i].strip() or len(lines[i]) - len(lines[i].lstrip()) > indent):
+                if (s := lines[i].strip()) and not s.startswith("#"):
+                    out.append(s)
+                i += 1
+        elif val.strip("'\""):
+            out.append(val.strip("'\""))
+    return out
+
+
+def manifest_commands(snap: Snapshot, included: list[str]) -> list[str]:
+    cmds: list[str] = []
+    if "Makefile" in included:
+        cmds += [f"make {m[1]}" for ln in read_snapshot(snap, "Makefile")
+                 if (m := re.match(r"([A-Za-z0-9_][\w./-]*)\s*:(?!=)", ln))]
+    scripts = _json(snap, "package.json", included).get("scripts", {})
+    cmds += [f"npm run {k}" for k in scripts] if isinstance(scripts, dict) else []
+    scripts = _toml(snap, "pyproject.toml", included).get("project", {}).get("scripts", {})
+    cmds += list(scripts) if isinstance(scripts, dict) else []
+    if "justfile" in included:
+        cmds += [f"just {m[1]}" for ln in read_snapshot(snap, "justfile")
+                 if (m := re.match(r"@?([A-Za-z_][\w-]*)(?:\s+[^:=]*)?:(?!=)", ln))]
+    for p in included:
+        if re.fullmatch(r"\.github/workflows/[^/]+\.ya?ml", p):
+            cmds += _workflow_runs(read_snapshot(snap, p))
+    return list(dict.fromkeys(cmds))
+
+
+def import_path_len(g: Graph, a: str, b: str, max_len: int = 2) -> int | None:
+    adj: dict[str, set[str]] = {}
+    for x, y in g.edges:
+        adj.setdefault(x, set()).add(y)
+        adj.setdefault(y, set()).add(x)
+    seen, frontier = {a}, {a}
+    for d in range(max_len + 1):
+        if b in frontier:
+            return d
+        frontier = {n for f in frontier for n in adj.get(f, ())} - seen
+        seen |= frontier
+    return None
 
 
 @dataclass(frozen=True)
