@@ -32,7 +32,7 @@ flowchart LR
   H --> I[Validate + publish]
 ```
 
-The backend is called in Catalog, Plan, Chapters and Index, plus one probe call in the backend check (only when the backend or its version changes) and an occasional plan re-ask during Attach.
+The backend is called in Catalog, Plan, Chapters and Index, plus one probe call in the backend check (when the backend fingerprint changes, see Safety) and an occasional plan re-ask during Attach.
 
 ## Install
 
@@ -79,10 +79,10 @@ The default backend is `agy --disable-slash-commands -p`; agy takes the next arg
 | File reads | not restricted by agy: it can read files anywhere on disk, and agy's own flags do not prevent this |
 | OS sandbox | the tool runs every backend call under it (below) |
 
-- **macOS:** every call runs under `sandbox-exec`. Reads under `$HOME` are denied except agy's config dirs and a few `~/Library` cache/support dirs; the repo root and state dir are also denied for reads and writes. Reads elsewhere on disk (for example `/etc`, `/tmp`) are not restricted. Writes are allowed only in temp dirs, agy's config dirs and `~/Library/Caches` and `~/Library/Application Support`; writes to agy's `settings.json` are denied.
+- **macOS:** every call runs under `sandbox-exec`. Reads under `$HOME` are denied, except `~/.gemini`, `~/.antigravity`, `~/.local`, all of `~/Library`, and the `$HOME` directory listing itself. The repo root and state dir are denied for both reads and writes. Reads outside `$HOME` (for example `/etc`, `/tmp`) are not restricted. Writes are allowed only in `/dev`, temp dirs, `~/.gemini`, `~/.antigravity`, `~/Library/Caches` and `~/Library/Application Support`; writes to agy's `settings.json` are denied.
 - **Linux:** uses `bwrap` if installed. This is implemented but has not been tested on Linux.
 - **No sandbox available**, or a yolo flag such as `--dangerously-skip-permissions`: the run exits 5 unless you pass `--unsafe-backend`.
-- On a backend fingerprint change the tool makes one probe call asking the backend to read a sentinel file under `$HOME`. This is a regression check, not authorization. If access is observed under an active sandbox, the run stops with exit 5.
+- The backend fingerprint covers the command, backend version, sandbox profile, deny paths, adapter version and `REPO_SUMMARIZE_CACHE_NAMESPACE`. When it changes, or after a run that observed access, the tool makes one probe call asking the backend to read a sentinel file under `$HOME`. This is a regression check, not authorization. If access is observed under an active sandbox, the run stops with exit 5.
 - The sandbox does not restrict network access or starting other programs.
 - If your agy settings contain allow-rules (for example `command(...)`), they widen what agy may do. The tool lists them in `provenance.json`.
 
