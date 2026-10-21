@@ -1082,6 +1082,232 @@ def load_plan(state_dir: Path) -> tuple[list[Chapter], dict] | None:
         return None
 
 
+# --- attach -----------------------------------------------------------------
+
+SIG_RE = re.compile(r"^\s*(async\s+)?(def|class|function|func|fn|export\s+(function|class)|CREATE)\b|^[A-Za-z_][\w-]*:")
+DEF_RE = re.compile(r"^\s*(async\s+)?(def|class|function|export)\b")
+MARKER_NAMES = {"__init__.py", "index.js", "index.ts"}
+RELATED_HEAD = 40
+DIRECTIVE_BYTES = 1_000
+
+
+def _is_config(p: str) -> bool:
+    name = Path(p).name
+    return Path(p).suffix in CONFIG_EXTS or name.startswith("Dockerfile") or name in {"Makefile", "justfile"}
+
+
+def _is_code(p: str) -> bool:
+    # an extensionless non-dot file only passes discovery with a shebang
+    name, suffix = Path(p).name, Path(p).suffix
+    return not _is_config(p) and (suffix in CODE_EXTS or (not suffix and not name.startswith(".")))
+
+
+def _exclusion(path: str, lines: list[str], graph: Graph, catalog: dict[str, CatalogRow]) -> str | None:
+    if not any(ln.strip() for ln in lines):
+        return "empty"
+    if path in graph.shims:
+        return "shim"
+    if Path(path).name in MARKER_NAMES and not any(DEF_RE.match(ln) for ln in lines):
+        return "package-marker"
+    if (row := catalog.get(path)) and row.failed:
+        return "catalog-failed"
+    for ln in lines[:5]:
+        low = ln.lower()
+        if "@generated" in low or ("generated" in low and "do not edit" in low):
+            return "generated"
+    return None
+
+
+def _place(chapters: list[Chapter], graph: Graph, files: list[str]) -> None:
+    """§6.4 steps 1, 3 and 4 on chapters, in place.
+
+    Limits: files in a top-level source directory that no chapter owns stay unplaced, for step 5.
+    """
+    keep = set(files)
+    for c in chapters:
+        c.primary = [p for p in dict.fromkeys(c.primary) if p in keep]
+        c.related = [p for p in dict.fromkeys(c.related) if p in keep]
+    role = {c.role: c for c in chapters}
+    orient, flow, contrib = role["orientation"], role["main_flow"], role["contributing"]
+    # 1. Entry points → primary in main flow (moved out of any other chapter); their direct imports → related
+    entries = [e for e in graph.entry_points if e in keep]
+    for c in chapters:
+        c.primary = [p for p in c.primary if p not in entries]
+    flow.primary[:0] = entries
+    flow.related += [b for a, b in sorted(graph.edges) if a in entries and b in keep]
+    # 2. Leftovers → contributing / orientation by kind, else same dir, then parent dirs, then import neighbours.
+    #    Repeat until nothing moves: a placed file can give its neighbours an owner.
+    owner = {p: c for c in chapters for p in c.primary}
+    related = {p for c in chapters for p in c.related}
+    by_dir: dict[str, list[str]] = {}
+    under: dict[str, list[str]] = {}
+    nbrs: dict[str, list[str]] = {}
+    for p in files:
+        by_dir.setdefault(_dir(p), []).append(p)
+        parts = p.split("/")
+        for i in range(1, len(parts)):
+            under.setdefault("/".join(parts[:i]), []).append(p)
+    for a, b in graph.edges:
+        nbrs.setdefault(a, []).append(b)
+        nbrs.setdefault(b, []).append(a)
+
+    def best(paths) -> Chapter | None:
+        counts: dict[int, int] = {}
+        for p in paths:
+            if c := owner.get(p):
+                counts[id(c)] = counts.get(id(c), 0) + 1
+        return max(chapters, key=lambda c: counts.get(id(c), 0)) if counts else None  # ties → earlier chapter
+
+    def home(p: str) -> Chapter | None:
+        if _is_contrib(p):
+            return contrib
+        if "/" not in p and not _is_code(p):
+            return orient
+        d = _dir(p)
+        if c := best(by_dir[d]):
+            return c
+        while d:
+            if c := best(under[d]):
+                return c
+            d = _dir(d)
+        return best(nbrs.get(p, ()))
+
+    pending = [p for p in files if p not in owner and p not in related]
+    while pending:
+        rest = []
+        for p in pending:
+            if c := home(p):
+                c.primary.append(p)
+                owner[p] = c
+            else:
+                rest.append(p)
+        if len(rest) == len(pending):
+            break
+        pending = rest
+    src = set(_source_dirs(files))
+    orient.primary += [p for p in pending if p.split("/")[0] not in src or "/" not in p]
+    # 3. Related to more than RELATED_MAX chapters → related to orientation only
+    for c in chapters:
+        c.related = [p for p in dict.fromkeys(c.related) if p not in c.primary]
+    counts: dict[str, int] = {}
+    for c in chapters:
+        for p in c.related:
+            counts[p] = counts.get(p, 0) + 1
+    many = sorted(p for p, n in counts.items() if n > RELATED_MAX)
+    for c in chapters:
+        c.related = [p for p in c.related if p not in many]
+    orient.related += [p for p in many if p not in orient.primary]
+
+
+def _source_dirs(files: list[str]) -> list[str]:
+    return sorted({p.split("/")[0] for p in files if "/" in p and not is_test(p) and _is_code(p)})
+
+
+def attach(chapters: list[Chapter], graph: Graph, catalog: dict[str, CatalogRow], snap: Snapshot,
+           included: list[str], runner: Runner, readme: str = "") -> tuple[list[Chapter], dict[str, str]]:
+    """Places every included file into the plan (§6.4) and fills each chapter's source budget.
+
+    Contract:
+    - Returns (fresh chapters with tests/shown/not_shown filled, {excluded path: reason}).
+    - Capped/Aborted from the one re-ask propagate; ValueError/CallFailed there mean "still unrepresented".
+    - Raises AssertionError if the placement invariant is broken (a programming error).
+    """
+    # 1. Exclusions; tests never get one (they are listed, never narrated)
+    excluded = {}
+    for p in included:
+        if not is_test(p) and (why := _exclusion(p, read_snapshot(snap, p), graph, catalog)):
+            excluded[p] = why
+    files = [p for p in included if not is_test(p) and p not in excluded]
+    src_dirs = _source_dirs(files)
+
+    def placed(plan: list[Chapter]) -> tuple[list[Chapter], list[str]]:
+        out = [Chapter(c.role, c.slug, c.title, c.why, list(c.primary), list(c.related)) for c in plan]
+        _place(out, graph, files)
+        tops = {p.split("/")[0] for c in out for p in c.primary if "/" in p}
+        return out, [d for d in src_dirs if d not in tops]
+
+    # 2. Steps 1-4 on the given plan
+    out, missing = placed(chapters)
+    if missing:
+        # 3. Step 5: one re-ask naming every unrepresented dir; adopt the new plan only if it covers more
+        directive = ("Every top-level source directory must have a primary file in some chapter. "
+                     f"Missing: {', '.join(missing)}.")
+        if len(directive.encode()) > DIRECTIVE_BYTES:
+            directive = directive.encode()[:DIRECTIVE_BYTES - len("…".encode())].decode(errors="ignore") + "…"
+        try:
+            new, bad = _validate(runner.ask_json("plan", plan_prompt(catalog, graph, readme, directive)), catalog)
+        except (ValueError, CallFailed):
+            new, bad = [], ["unusable reply"]
+        if not bad and len((cand := placed(new))[1]) < len(missing):
+            out, missing = cand
+        # 4. Still missing → a deterministic subsystem chapter, or at the cap merge into the smallest subsystem
+        prim = {p for c in out for p in c.primary}
+        for d in missing:
+            take = [p for p in files if p.startswith(d + "/") and p not in prim]
+            if len(out) < MAX_CHAPTERS:
+                at = next(i for i, c in enumerate(out) if c.role == "contributing")
+                out.insert(at, Chapter("subsystem", sanitize_slug(d, d), d, f"The {d} directory.", take))
+            else:
+                subs = [c for c in out if c.role == "subsystem"] or [c for c in out if c.role == "main_flow"]
+                min(subs, key=lambda c: len(c.primary)).primary += take
+        _unique_slugs(out)
+    # 5. Tests (§6.4 step 2), after placement so they follow the final chapters; graph edges already pass shims
+    deps: dict[str, set[str]] = {}
+    for a, b in graph.edges:
+        deps.setdefault(a, set()).add(b)
+    tests = [t for t in included if is_test(t)]
+    for c in out:
+        c.related = [p for p in c.related if p not in c.primary]
+        mine = set(c.primary) | set(c.related)
+        c.tests = [t for t in tests if deps.get(t, set()) & mine]
+    # 6. Invariant: primary in exactly one chapter, or related somewhere (excluded/tests were filtered out)
+    n_prim: dict[str, int] = {}
+    for c in out:
+        for p in c.primary:
+            n_prim[p] = n_prim.get(p, 0) + 1
+    rel = {p for c in out for p in c.related}
+    broken = [p for p in files if n_prim.get(p, 0) > 1 or (p not in n_prim and p not in rel)]
+    if broken:
+        raise AssertionError(f"placement invariant broken: {broken[:20]}")
+    for c in out:
+        fill_budget(c, snap, graph, BUDGET_INSTR + BUDGET_CATALOG + BUDGET_TESTS)
+    return out, excluded
+
+
+def _render_cost(path: str, lines: list[str], ranges: list[tuple[int, int]]) -> int:
+    """Bytes of the line-numbered rendering of ranges, plus the per-file header."""
+    return len(f"=== {path} ===\n".encode()) + sum(
+        len(f"{n:>5}  {lines[n - 1]}\n".encode()) for s, e in ranges for n in range(s, e + 1))
+
+
+def fill_budget(ch: Chapter, snap: Snapshot, graph: Graph, fixed_bytes: int) -> None:
+    """Greedily fills ch.shown (path → 1-based inclusive ranges) within PROMPT_LIMIT - fixed_bytes; the rest → not_shown."""
+    room = PROMPT_LIMIT - fixed_bytes
+    ch.shown = {}
+    text = {p: read_snapshot(snap, p) for p in ch.primary + ch.related}
+
+    def offer(p: str, ranges: list[tuple[int, int]]) -> None:
+        nonlocal room
+        cost = _render_cost(p, text[p], ranges)
+        if ranges and cost <= room:
+            ch.shown[p] = ranges
+            room -= cost
+
+    prim = sorted(ch.primary, key=lambda p: (-graph.fan_in.get(p, 0), p))
+    # 1. Primary files in full, highest fan-in first
+    for p in prim:
+        offer(p, [(1, len(text[p]))])
+    # 2. Signature lines only for the primaries that did not fit
+    for p in prim:
+        if p not in ch.shown:
+            offer(p, [(n, n) for n, ln in enumerate(text[p], 1) if SIG_RE.match(ln)])
+    # 3. The head of each related file
+    for p in ch.related:
+        offer(p, [(1, min(RELATED_HEAD, len(text[p])))])
+    # 4. Anything with nothing shown
+    ch.not_shown = [p for p in ch.primary + ch.related if p not in ch.shown]
+
+
 @dataclass(frozen=True)
 class Options:
     path: Path
