@@ -46,6 +46,7 @@ SHIM_RATIO = 0.8
 MAX_CHAPTERS = 12
 TIMEOUT = 300
 BREAKER = 3
+TOOL_DENIED_BREAKER = 10
 NO_TOOLS = ("You have no tools: do not run commands, read files, or browse. Everything you need is in this "
             "prompt. Reply only in the requested format.")
 TOOL_RETRY = "Your previous attempt tried to use a tool, which is not available here. Answer from the prompt text only."
@@ -661,7 +662,7 @@ class Runner:
         self.backend, self.max_calls, self.force, self.log_path = backend, max_calls, force, log_path
         self.cache = Path(state_dir) / "cache"
         self.stats = {"calls_by_stage": {}, "cache_hits_by_stage": {}}
-        self._calls = self._fails = 0
+        self._calls = self._fails = self._denied = 0
 
     def _key(self, stage: str, prompt: str) -> str:
         head = f"{stage}:{STAGE_VERSIONS[stage]}\0{self.backend.fingerprint}\0"
@@ -698,13 +699,17 @@ class Runner:
         try:
             reply = call(self.backend, prompt)
         except CallFailed as e:
-            if e.reason != "tool-denied":  # nondeterministic model behavior, not an outage: leave the counter alone
+            if e.reason == "tool-denied":  # nondeterministic model behavior: own, looser breaker
+                self._denied += 1
+            else:
                 self._fails += 1
             self._log(stage, key, prompt, "", False, False, e.reason)
+            if self._denied >= TOOL_DENIED_BREAKER:
+                raise Aborted(f"the backend keeps trying to use tools ({TOOL_DENIED_BREAKER} consecutive denials)") from e
             if self._fails >= BREAKER:
                 raise Aborted(f"{BREAKER} consecutive backend failures") from e
             raise
-        self._fails = 0
+        self._fails = self._denied = 0
         self._store(path, reply)
         self._log(stage, key, prompt, reply, False, True, None)
         return reply

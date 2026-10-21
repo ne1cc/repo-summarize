@@ -163,3 +163,30 @@ def test_tool_denied_neither_counts_nor_resets(rs, mk, monkeypatch):
             r.ask("chapter", f"STAGE: chapter\n{i}")
     with pytest.raises(rs.Aborted):
         r.ask("chapter", "STAGE: chapter\nlast")
+
+
+def test_ten_consecutive_tool_denied_abort(rs, mk):
+    r, _ = mk({"chapter": "", "stderr": "auto-denied"})
+    for i in range(rs.TOOL_DENIED_BREAKER - 1):
+        with pytest.raises(rs.CallFailed):
+            r.ask("chapter", f"STAGE: chapter\n{i}")
+    with pytest.raises(rs.Aborted, match="tools"):
+        r.ask("chapter", "STAGE: chapter\nlast")
+
+
+def test_tool_denied_streak_reset_by_success(rs, mk, monkeypatch):
+    r, _ = mk({})
+    n = rs.TOOL_DENIED_BREAKER - 1
+
+    def deny(b, p):
+        raise rs.CallFailed("tool-denied")
+    monkeypatch.setattr(rs, "call", deny)
+    for i in range(n):
+        with pytest.raises(rs.CallFailed):
+            r.ask("chapter", f"STAGE: chapter\na{i}")
+    monkeypatch.setattr(rs, "call", lambda b, p: "ok")
+    r.ask("chapter", "STAGE: chapter\nok")
+    monkeypatch.setattr(rs, "call", deny)
+    for i in range(n):
+        with pytest.raises(rs.CallFailed):
+            r.ask("chapter", f"STAGE: chapter\nb{i}")

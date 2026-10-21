@@ -168,7 +168,9 @@ def test_e2e_tool_denied_degrades_not_aborts(rs, tool):
     assert code == rs.EXIT_OK
     arch = repo / ARCH
     assert (arch / "INDEX.md").is_file()
-    assert calls.count("plan") >= 2 and calls.count("chapter") >= 3
+    assert calls.count("plan") == 3 and calls.count("chapter") >= 3
+    index = (arch / "INDEX.md").read_text()  # fallback_plan titles, not BOOK_PLAN's "Main flow"
+    assert "The main flow" in index and "Main flow" not in index and "Core" not in index
     unc = (arch / "UNCERTAINTIES.md").read_text()
     assert "generation failed; this chapter lists its files only" in unc
     assert sum("lists its files only" in p.read_text() for p in arch.glob("[0-9][0-9]-*.md")) == 1
