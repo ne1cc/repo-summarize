@@ -598,6 +598,96 @@ def probe(b: Backend, home: Path, token: str | None = None) -> str:
         shutil.rmtree(run_dir, ignore_errors=True)
 
 
+# --- cache ------------------------------------------------------------------
+
+STAGE_VERSIONS = {"catalog": 1, "plan": 1, "chapter": 1, "index": 1}
+
+
+class Capped(Exception):
+    pass
+
+
+class Aborted(Exception):
+    pass
+
+
+def extract_json(reply: str):
+    dec = json.JSONDecoder()
+    for m in re.finditer(r"[{\[]", reply):
+        try:
+            return dec.raw_decode(reply, m.start())[0]
+        except ValueError:
+            continue
+    raise ValueError("no JSON value in reply")
+
+
+def ensure_state_dir(root: Path) -> Path:
+    d = Path(root) / "docs" / ".repo-summarize"
+    d.mkdir(parents=True, exist_ok=True)
+    d.chmod(0o700)
+    gi = d / ".gitignore"
+    if not gi.exists():
+        gi.write_text("*\n")
+    return d
+
+
+class Runner:
+    def __init__(self, backend: Backend, state_dir: Path, max_calls: int | None, force: bool,
+                 log_path: Path | None = None):
+        self.backend, self.max_calls, self.force, self.log_path = backend, max_calls, force, log_path
+        self.cache = Path(state_dir) / "cache"
+        self.stats = {"calls_by_stage": {}, "cache_hits_by_stage": {}}
+        self._calls = self._fails = 0
+
+    def _key(self, stage: str, prompt: str) -> str:
+        head = f"{stage}:{STAGE_VERSIONS[stage]}\0{self.backend.fingerprint}\0"
+        return hashlib.sha256(head.encode() + prompt.encode()).hexdigest()
+
+    def _log(self, stage, key, prompt, reply, cached, ok, reason):
+        if self.log_path:
+            with open(self.log_path, "a") as f:  # sizes only, never bodies
+                f.write(json.dumps({"stage": stage, "key": key[:12], "bytes_in": len(prompt.encode()),
+                                    "bytes_out": len(reply.encode()), "cached": cached, "ok": ok,
+                                    "reason": reason}) + "\n")
+
+    def _store(self, path: Path, reply: str) -> None:
+        self.cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, tmp = tempfile.mkstemp(dir=self.cache, suffix=".tmp")  # mkstemp creates 0600
+        with os.fdopen(fd, "w") as f:
+            f.write(reply)
+        os.replace(tmp, path)
+
+    def ask(self, stage: str, prompt: str) -> str:
+        key = self._key(stage, prompt)
+        path = self.cache / f"{key}.txt"
+        if not self.force and path.is_file():
+            reply = path.read_text()
+            hits = self.stats["cache_hits_by_stage"]
+            hits[stage] = hits.get(stage, 0) + 1
+            self._log(stage, key, prompt, reply, True, True, None)
+            return reply
+        if self.max_calls is not None and self._calls >= self.max_calls:
+            raise Capped(f"call cap {self.max_calls} reached")
+        self._calls += 1
+        by = self.stats["calls_by_stage"]
+        by[stage] = by.get(stage, 0) + 1
+        try:
+            reply = call(self.backend, prompt)
+        except CallFailed as e:
+            self._fails += 1
+            self._log(stage, key, prompt, "", False, False, e.reason)
+            if self._fails >= BREAKER:
+                raise Aborted(f"{BREAKER} consecutive backend failures") from e
+            raise
+        self._fails = 0
+        self._store(path, reply)
+        self._log(stage, key, prompt, reply, False, True, None)
+        return reply
+
+    def ask_json(self, stage: str, prompt: str):
+        return extract_json(self.ask(stage, prompt))
+
+
 @dataclass(frozen=True)
 class Options:
     path: Path
