@@ -617,12 +617,17 @@ def extract_json(reply: str):
             return json.loads(block)
         except ValueError:
             continue
-    dec, best = json.JSONDecoder(), None
+    dec, best, skip = json.JSONDecoder(), None, 0
     for m in re.finditer(r"[{\[]", reply):
+        if m.start() < skip:  # nested inside an already decoded value
+            continue
         try:
             val, end = dec.raw_decode(reply, m.start())
         except ValueError:
             continue
+        except RecursionError:  # pathologically deep nesting: stop scanning (every later start is just as slow)
+            break
+        skip = end
         if best is None or end - m.start() > best[0]:
             best = (end - m.start(), val)
     if best is None:

@@ -125,3 +125,14 @@ def test_log_has_no_bodies(rs, mk, tmp_path):
     assert first["cached"] is False and second["cached"] is True
     assert first["ok"] is True and first["reason"] is None and len(first["key"]) == 12
     assert first["stage"] == "chapter" and first["bytes_out"] == len("SECRET-REPLY-TEXT")
+
+
+def test_extract_json_nested_is_fast(rs):
+    import time
+    t = time.perf_counter()
+    with pytest.raises(ValueError):  # too deep for the decoder: rejected, not hung
+        rs.extract_json("[" * 16000 + "]" * 16000)
+    assert time.perf_counter() - t < 1
+    t = time.perf_counter()
+    assert rs.extract_json("[" * 500 + "]" * 500 + "x" * 30000)  # nested within limits: one decode
+    assert time.perf_counter() - t < 1
