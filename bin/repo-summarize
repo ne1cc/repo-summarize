@@ -5,6 +5,10 @@
 # ///
 """repo-summarize: turn a repo into a short book of Markdown docs."""
 import argparse
+import fnmatch
+import os
+import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +39,89 @@ NEW_FILES_RATIO = 0.10
 RELATED_MAX = 3
 DEFAULT_CMD = "agy --disable-slash-commands -p"
 MARKER = "repo-summarize:v3"
+
+
+# --- discover ---------------------------------------------------------------
+
+SKIP_REASONS = ("symlink", "unsafe-path", "binary", "too-large", "lockfile", "minified",
+                "generated-docs", "secret-file", "unsupported-type")
+CODE_EXTS = {".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".lua", ".sh", ".zsh", ".sql", ".cpp", ".c",
+             ".h", ".hpp", ".java", ".cmake", ".kt", ".swift", ".yml", ".yaml", ".toml", ".json",
+             ".properties", ".ini", ".cfg"}
+LOCKFILES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "Cargo.lock", "go.sum", "poetry.lock"}
+ENV_SAFE = {".env.example", ".env.sample", ".env.template"}
+SECRET_GLOBS = ("*.pem", "*.key", "*.p12", "*id_rsa*", "*credentials*.json")
+UNSAFE_PATH = re.compile(r"[\x00-\x1f\x7f`|]")
+SHEBANG = re.compile(rb"#!.*\b(bash|sh|zsh|python\d*|node|ruby|perl)\b")
+
+
+@dataclass
+class Discovery:
+    root: Path
+    discovered: list[str]
+    included: list[str]
+    skipped: dict[str, list[str]]
+
+
+def _list_files(root: Path) -> list[str]:
+    git = subprocess.run(["git", "-C", str(root), "ls-files", "-co", "--exclude-standard", "-z"],
+                         capture_output=True)
+    if git.returncode == 0:
+        return sorted(set(git.stdout.decode(errors="surrogateescape").split("\0")) - {""})
+    out = []
+    for dp, dirs, names in os.walk(root):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        out += [os.path.relpath(os.path.join(dp, n), root) for n in names]
+    return sorted(out)
+
+
+def _skip_reason(root: Path, rel: str) -> str | None:
+    path, name, parts = root / rel, Path(rel).name, Path(rel).parts
+    if UNSAFE_PATH.search(rel):
+        return "unsafe-path"
+    if path.is_symlink():
+        return "symlink"
+    if parts[:2] in (("docs", "architecture"), ("docs", ".repo-summarize")):
+        return "generated-docs"
+    if (name.startswith(".env") and name not in ENV_SAFE) or "secrets" in parts[:-1] \
+            or any(fnmatch.fnmatch(name, g) for g in SECRET_GLOBS):
+        return "secret-file"
+    if name in LOCKFILES or name.endswith(".lock"):
+        return "lockfile"
+    if re.search(r"\.min\.(js|css)$", name):
+        return "minified"
+    if not path.is_file():
+        return "unsupported-type"
+    with path.open("rb") as f:
+        head = f.read(BINARY_PROBE)
+    suffix = path.suffix
+    if suffix == ".md":
+        ok = len(parts) == 1 or parts[0] == ".github"
+    elif suffix or name.startswith("."):
+        ok = suffix in CODE_EXTS or name in ENV_SAFE
+    else:
+        ok = name.startswith("Dockerfile") or name in {"Makefile", "justfile"} \
+            or bool(SHEBANG.match(head.split(b"\n", 1)[0]))
+    if not ok:
+        return "unsupported-type"
+    if b"\0" in head:
+        return "binary"
+    if path.stat().st_size > MAX_FILE:
+        return "too-large"
+    return None
+
+
+def discover(root: Path) -> Discovery:
+    files = _list_files(root)
+    d = Discovery(root, files, [], {})
+    for rel in files:
+        reason = _skip_reason(root, rel)
+        if reason:
+            d.skipped.setdefault(reason, []).append(rel)
+        else:
+            d.included.append(rel)
+    d.included.sort()
+    return d
 
 
 @dataclass(frozen=True)
