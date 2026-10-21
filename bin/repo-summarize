@@ -9,6 +9,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import posixpath
 import re
 import secrets
 import shlex
@@ -17,9 +18,12 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_ABORT, EXIT_CAPPED, EXIT_UNSAFE = 0, 1, 2, 3, 4, 5
 
@@ -1485,6 +1489,502 @@ def run_index(chapters: list[Chapter], replies: dict[str, dict | None], graph: G
             bad.append(f"why must be a list of {len(chapters)} strings")
         return bad
     return _ask_validated(runner, "index", prompt, valid)
+
+
+# --- render -----------------------------------------------------------------
+
+RENDER_DIR = "docs/architecture"
+SECRET_TEXT = "[removed: possible secret]"
+WORKING_TREE = "working tree — may have changed since generation"
+LIMIT_SENTENCE = ("These labels check structure only: a cited symbol can exist and still be the wrong place to make "
+                  "a change, and that cannot be detected automatically.")
+IMPORT_CONNECTED = "import-connected; execution order not checked"
+INFERRED = "inferred transition — no import path found"
+LABEL_MEANINGS = {
+    "source-excerpt-attached": "the excerpt is the snapshot text of that range",
+    "reference-valid": f"the path is a chapter file and 1 ≤ start ≤ end ≤ EOF, length ≤ {REF_MAX}",
+    "not-shown": "the cited range was outside the ranges shown to the model",
+    "identifier-matched": f"a declared identifier occurs within ± {IDENT_WINDOW} lines of the cited line "
+                          "(the line is corrected to it)",
+    "identifier-moved": "a declared identifier occurs elsewhere in the file; the citation is rewritten to its "
+                        "nearest occurrence",
+    "unmatched": "no declared identifier occurs in the file",
+    "import-connected": "an import path of length ≤ 2 connects consecutive main-flow steps; "
+                        "execution order not checked",
+    "inferred-transition": "no such import path",
+}
+MARKS = {"unmatched": "⚠ ", "not-shown": "⚠ ", "identifier-moved": "~ "}
+FENCE_LANG = {"py": "python", "js": "javascript", "jsx": "javascript", "ts": "typescript", "tsx": "typescript",
+              "sh": "bash", "zsh": "bash", "sql": "sql", "yml": "yaml", "yaml": "yaml", "toml": "toml",
+              "json": "json", "go": "go", "rs": "rust"}
+MERMAID_HEAD = re.compile(
+    r"(graph|flowchart)[ \t]+(TD|TB|BT|RL|LR)"
+    r"|(sequenceDiagram|classDiagram(-v2)?|stateDiagram(-v2)?|erDiagram|journey|gantt|pie|mindmap|timeline"
+    r"|gitGraph|quadrantChart|requirementDiagram|kanban|C4(Context|Container|Component|Dynamic|Deployment)"
+    r"|(sankey|xychart|block|packet|architecture)-beta)([ \t].*)?")
+GITHUB_RE = re.compile(r"(?:https?://(?:[^@/]+@)?github\.com/|(?:ssh://)?git@github\.com[:/])"
+                       r"([^/\s]+)/([^/\s]+?)(?:\.git)?/?")
+DEF_SYM = r"\b(def|class|function|func|fn|const|let|var|type|interface|struct|enum)\s+{}\b"
+KEYED_CONFIG = {".yml", ".yaml", ".toml", ".json"}
+
+
+@dataclass
+class GitInfo:
+    commit: str | None
+    branch: str | None
+    dirty: bool
+    github: tuple[str, str] | None
+    clean_files: set[str]
+
+
+def _git_out(root: Path, *args: str) -> str | None:
+    r = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, errors="surrogateescape")
+    return r.stdout if r.returncode == 0 else None
+
+
+def parse_github(url: str) -> tuple[str, str] | None:
+    """(owner, repo) from an https or ssh GitHub remote; credentials and .git are dropped."""
+    m = GITHUB_RE.fullmatch(url.strip())
+    return (m[1], m[2]) if m else None
+
+
+def git_info(root: Path, included: list[str]) -> GitInfo:
+    """Clean files are tracked and identical to HEAD; no repo or no commit → commit and github are None."""
+    commit = (_git_out(root, "rev-parse", "--verify", "-q", "HEAD^{commit}") or "").strip()
+    if not commit:
+        return GitInfo(None, None, False, None, set())
+    branch = (_git_out(root, "symbolic-ref", "-q", "--short", "HEAD") or "").strip() or None
+    dirty = bool((_git_out(root, "status", "--porcelain") or "").strip())
+    tracked = set((_git_out(root, "ls-files", "-z") or "").split("\0"))
+    changed = set((_git_out(root, "diff", "--name-only", "--relative", "-z", "HEAD") or "").split("\0"))
+    url = _git_out(root, "remote", "get-url", "origin")
+    return GitInfo(commit, branch, dirty, parse_github(url) if url else None,
+                   {p for p in included if p in tracked and p not in changed})
+
+
+def source_link(gi: GitInfo, path: str, a: int, b: int, rel_from: str) -> tuple[str, str]:
+    """(url, label): a commit permalink for clean files on GitHub, else a relative working-tree link."""
+    if gi.github and gi.commit and path in gi.clean_files:
+        o, r = gi.github
+        return f"https://github.com/{quote(o)}/{quote(r)}/blob/{gi.commit}/{quote(path)}#L{a}-L{b}", ""
+    # shortcut: a non-GitHub origin is labelled (local) too, since GitInfo keeps only GitHub remotes
+    return f"{quote(posixpath.relpath(path, rel_from))}#L{a}-L{b}", WORKING_TREE if gi.github else "(local)"
+
+
+def _fence(text: str) -> str:
+    return "`" * max(3, max(map(len, re.findall(r"`+", text)), default=0) + 1)
+
+
+def _code(s: str) -> str:
+    """Inline code that survives backticks and control characters in s."""
+    s = re.sub(r"[\x00-\x1f\x7f]", lambda m: f"\\x{ord(m[0]):02x}", s)
+    ticks = "`" * (max(map(len, re.findall(r"`+", s)), default=0) + 1)
+    pad = " " if s.startswith("`") or s.endswith("`") else ""
+    return f"{ticks}{pad}{s}{pad}{ticks}"
+
+
+def _line(s: str) -> str:
+    return " ".join(s.split())
+
+
+def _cell(s: str) -> str:
+    return _line(s).replace("|", "\\|")
+
+
+def _label(label: str) -> str:
+    return MARKS.get(label, "") + label
+
+
+def resolve_ref(ref: dict, path: str, ch: Chapter, snap: Snapshot, gi: GitInfo,
+                rel_from: str) -> tuple[str | None, list[str]]:
+    """Returns (link line + snapshot excerpt, labels), or (None, [reason]) for an invalid ref."""
+    # 1. Path must be relative, a chapter file, and in the snapshot
+    if not isinstance(path, str) or path.startswith("/") or ".." in path.split("/"):
+        return None, ["unsafe path"]
+    if path not in ch.primary + ch.related:
+        return None, ["not a chapter file"]
+    try:
+        lines = read_snapshot(snap, path)
+    except OSError:
+        return None, ["not in the snapshot"]
+    # 2. Range within the file and at most REF_MAX lines
+    a, b = (ref.get("start"), ref.get("end")) if isinstance(ref, dict) else (None, None)
+    if not (_is_int(a) and _is_int(b) and 1 <= a <= b <= len(lines)):
+        return None, ["out of range"]
+    if b - a + 1 > REF_MAX:
+        return None, [f"longer than {REF_MAX} lines"]
+    # 3. not-shown when any cited line was outside what the model saw
+    labels = ["reference-valid", "source-excerpt-attached"]
+    shown = ch.shown.get(path, [])
+    if not all(any(s <= n <= e for s, e in shown) for n in range(a, b + 1)):
+        labels.append("not-shown")
+    url, note = source_link(gi, path, a, b, rel_from)
+    body = "\n".join(lines[a - 1:b])
+    fence = _fence(body)
+    lang = FENCE_LANG.get(path.rpartition(".")[2], "") if "." in Path(path).name else ""
+    head = f"[{_code(f'{path}:{a}-{b}')}]({url})" + (f" — {note}" if note else "")
+    head += " · " + " · ".join(map(_label, labels))
+    return f"{head}\n\n{fence}{lang}\n{body}\n{fence}", labels
+
+
+def _word(ident: str) -> re.Pattern:
+    return re.compile((r"\b" if re.match(r"\w", ident) else "") + re.escape(ident)
+                      + (r"\b" if re.search(r"\w$", ident) else ""))
+
+
+def check_citation(lines: list[str], line: int, identifiers: list[str]) -> tuple[int, str]:
+    """Nearest occurrence of any identifier: within IDENT_WINDOW → matched, elsewhere → moved, none → unmatched."""
+    pats = [_word(i) for i in identifiers if i]
+    hits = [n for n, ln in enumerate(lines, 1) if any(p.search(ln) for p in pats)]
+    if not hits:
+        return line, "unmatched"
+    near = min(hits, key=lambda n: (abs(n - line), n))
+    return near, "identifier-matched" if abs(near - line) <= IDENT_WINDOW else "identifier-moved"
+
+
+def _defines(lines: list[str], sym: str, path: str) -> bool:
+    s = re.escape(sym)
+    rx = [re.compile(DEF_SYM.format(s)), re.compile(rf"^\s*{s}\s*[:=(]")]
+    if Path(path).suffix in KEYED_CONFIG or Path(path).name == "Makefile":
+        rx.append(re.compile(rf"^\s*[\"']{s}[\"']\s*:"))  # quoted JSON/YAML keys
+    return any(r.search(ln) for ln in lines for r in rx)
+
+
+def _safe(s: str, home: str, repo: str) -> str:
+    """Secret → placeholder; absolute paths under home but outside repo → [path removed]."""
+    if scan_secret(s):
+        return SECRET_TEXT
+    h, r = home.rstrip("/"), repo.rstrip("/")
+    if not h:
+        return s
+    return re.sub(re.escape(h) + r"(?![\w.-])[^\s`'\"<>()\[\]]*",
+                  lambda m: m[0] if m[0] == r or m[0].startswith(r + "/") else "[path removed]", s)
+
+
+def clean_model_text(s: str, home: str, repo: str) -> str:
+    """Model prose → plain text with inline code: no links, images, HTML or headings; secrets and home paths removed."""
+    s = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", _safe(s, home, repo))
+    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return re.sub(r"(?m)^([ \t]*)#+[ \t]*", r"\1", s)
+
+
+def _mermaid_header(s: str) -> bool:
+    return bool(MERMAID_HEAD.fullmatch(s.strip(" \t").rstrip(" \t;")))
+
+
+def wrap_mermaid(text: str) -> str:
+    """Port of v1's awk: retag untagged/text/diagram-keyword fences whose first statement is a Mermaid header as
+    ```mermaid, and fence bare diagrams up to the next blank line or heading. Real code fences are untouched."""
+    out: list[str] = []
+    buf: list[str] = []
+    pending = unfenced = False
+    fence = mark = pad = ""
+
+    def flush(tag: bool) -> None:
+        out.append(pad + mark + "mermaid" if tag else buf[0])
+        out.extend(buf[1:])
+        buf.clear()
+
+    for line in text.split("\n"):
+        t = line.lstrip(" \t")
+        ind = len(line) - len(t)
+        # 1. Untagged fence opened: buffer until its first statement decides the tag
+        if pending:
+            buf.append(line)
+            if t == "" or t.startswith("%%"):
+                continue
+            pending = False
+            if t.startswith(mark):
+                flush(False)
+                fence = ""
+            else:
+                flush(_mermaid_header(line))
+            continue
+        # 2. Inside a fence: copy until the closing mark
+        if fence:
+            out.append(line)
+            if re.fullmatch(re.escape(fence) + re.escape(fence[0]) + r"*[ \t]*", t):
+                fence = ""
+            continue
+        # 3. Inside a bare diagram: close it at a blank line, heading or fence
+        if unfenced:
+            if t == "" or t.startswith("#") or t.startswith(("```", "~~~")):
+                out.append(pad + "```")
+                unfenced = False
+            else:
+                out.append(line)
+                continue
+        # 4. Fence opening: diagram keyword tag → mermaid; untagged/text → decide later; else verbatim
+        if ind < 4 and (m := re.match(r"`{3,}|~{3,}", t)):
+            mark = fence = m[0]
+            info = t[len(mark):].strip(" \t")
+            pad = line[:ind]
+            if _mermaid_header(info):
+                out += [pad + mark + "mermaid", pad + info]
+            elif re.fullmatch(r"(text|txt|plaintext|ascii|mmd)?", info):
+                buf, pending = [line], True
+            else:
+                out.append(line)
+            continue
+        # 5. Bare Mermaid header outside any fence → open a fence
+        if ind < 4 and _mermaid_header(line):
+            pad = line[:ind]
+            out += [pad + "```mermaid", line]
+            unfenced = True
+            continue
+        out.append(line)
+    if pending:
+        flush(False)
+    if unfenced:
+        out.append(pad + "```")
+    return "\n".join(out)
+
+
+def _mermaid_block(text: str, home: str, repo: str) -> str | None:
+    """A ```mermaid block from model diagram text, or None when it is not Mermaid."""
+    w = wrap_mermaid(_safe(text, home, repo))
+    blocks = re.findall(r"(?ms)^[ \t]*(`{3,}|~{3,})(\w*)[^\n]*\n(.*?)^[ \t]*\1[`~]*[ \t]*$", w)
+    body = next((b for _, tag, b in blocks if tag == "mermaid"), blocks[0][2]) if blocks else w
+    body = body.strip("\n")
+    first = next((ln for ln in body.splitlines() if ln.strip() and not ln.strip().startswith("%%")), "")
+    if not _mermaid_header(first):
+        return None
+    f = _fence(body)
+    return f"{f}mermaid\n{body}\n{f}"
+
+
+@dataclass
+class _Ctx:
+    chapters: list[Chapter]
+    snap: Snapshot
+    graph: Graph
+    gi: GitInfo
+    home: str
+    repo: str
+
+    def clean(self, s: str) -> str:
+        return clean_model_text(s, self.home, self.repo)
+
+    def safe(self, s: str) -> str:
+        return _safe(s, self.home, self.repo)
+
+    def lines(self, path: str) -> list[str]:
+        try:
+            return read_snapshot(self.snap, path)
+        except OSError:
+            return []
+
+    def diagram(self, text: str, notes: list[str]) -> list[str]:
+        if block := _mermaid_block(text, self.home, self.repo):
+            return [block]
+        notes.append("diagram omitted: " + ("possible secret" if scan_secret(text) else "not Mermaid"))
+        return ["_No diagram._"]
+
+
+def _fname(i: int, ch: Chapter) -> str:
+    return f"{i:02d}-{ch.slug}.md"
+
+
+def _link_text(s: str) -> str:
+    return s.replace("[", "\\[").replace("]", "\\]")
+
+
+def _chlink(ctx: _Ctx, i: int, ch: Chapter, numbered: bool = True) -> str:
+    title = _link_text(_line(ctx.clean(ch.title)))
+    return f"[{f'{i:02d}. ' if numbered else ''}{title}]({_fname(i, ch)})"
+
+
+def _cite(ctx: _Ctx, path: str, line: int, label: str) -> str:
+    url, note = source_link(ctx.gi, path, line, line, RENDER_DIR)
+    return f"[{_code(f'{path}:{line}')}]({url})" + (f" — {note}" if note else "") + f" · {_label(label)}"
+
+
+def _steps(ctx: _Ctx, ch: Chapter, steps: list[dict], notes: list[str]) -> list[str]:
+    out = []
+    for k, st in enumerate(steps, 1):
+        out.append(f"**{k}.** {ctx.clean(st['text'])} ({_code(st['path'])})")
+        # 1. Ref → pasted snapshot excerpt with labels; invalid → dropped and recorded
+        if (ref := st.get("ref")) is not None:
+            md, labels = resolve_ref(ref, st["path"], ch, ctx.snap, ctx.gi, RENDER_DIR)
+            if md is None:
+                notes.append(f"step {k}: ref dropped ({_code(st['path'])}: {labels[0]})")
+            else:
+                out.append(md)
+                if "not-shown" in labels:
+                    notes.append(f"step {k}: {_code(st['path'])} cited outside the lines shown to the model (not-shown)")
+        # 2. Main flow: the model's transition text, then what the import graph says about it
+        if ch.role == "main_flow" and k < len(steps):
+            t = st.get("next_transition")
+            t = ctx.clean(t) if isinstance(t, str) else ""
+            connected = import_path_len(ctx.graph, st["path"], steps[k]["path"]) is not None
+            if not connected:
+                notes.append(f"step {k} → {k + 1}: {INFERRED}")
+            label = IMPORT_CONNECTED if connected else INFERRED
+            out.append(f"→ {t + ' ' if t else ''}_({label})_")
+    return out
+
+
+def _citations(ctx: _Ctx, items: list[dict], kind: str, notes: list[str]) -> list[str]:
+    """Changes (identifier = symbol, which must also be defined in path) or gotchas (declared identifiers)."""
+    out = []
+    for it in items:
+        lines = ctx.lines(it["path"])
+        idents = [it["symbol"]] if kind == "change" else it["identifiers"]
+        line, label = check_citation(lines, it["line"], idents)
+        if kind == "change" and label != "unmatched" and not _defines(lines, it["symbol"], it["path"]):
+            line, label = it["line"], "unmatched"
+        if label != "identifier-matched":
+            notes.append(f"{kind} citation {_code(it['path'] + ':' + str(line))}: {label}")
+        text = ctx.clean(it["task"] if kind == "change" else it["text"])
+        sym = f" {_code(ctx.safe(it['symbol']))}" if kind == "change" else ""
+        out.append(f"- {_line(text)}{sym} — {_cite(ctx, it['path'], line, label)}")
+    return out or ["_None._"]
+
+
+def _footer(ctx: _Ctx, ch: Chapter, gaps: list[str]) -> list[str]:
+    def files(ps: list[str]) -> str:
+        return ", ".join(map(_code, ps)) or "none"
+    mine = set(ch.primary + ch.related)
+    rel = [_chlink(ctx, j, c) for j, c in enumerate(ctx.chapters, 1)
+           if c is not ch and mine & set(c.primary + c.related)]
+    return ["---", f"**Primary files**: {files(ch.primary)}", f"**Related files**: {files(ch.related)}",
+            f"**Tests**: {files(ch.tests)}", f"**Related chapters**: {', '.join(rel) or 'none'}",
+            "**Known gaps**:" + ("".join(f"\n- {g}" for g in gaps) if gaps else " none")]
+
+
+def _render_chapter(ctx: _Ctx, i: int, ch: Chapter, reply: dict | None) -> tuple[str, list[str]]:
+    """Returns (chapter Markdown without the marker, known gaps for the footer and UNCERTAINTIES)."""
+    notes: list[str] = []
+    parts = [f"# {i:02d}. {_line(ctx.clean(ch.title))}", f"> {_line(ctx.clean(ch.why))}"]
+    if reply is None:
+        notes.append("generation failed; this chapter lists its files only")
+        parts.append("This chapter could not be generated; its files are listed below.")
+    else:
+        parts += ["## What this is", ctx.clean(reply["what_this_is"]),
+                  "## How it fits together", *ctx.diagram(reply["diagram"], notes),
+                  "## How it works", *(_steps(ctx, ch, reply["steps"], notes) or ["_None._"]),
+                  "## Where to change things", "\n".join(_citations(ctx, reply["changes"], "change", notes)),
+                  "## Gotchas", "\n".join(_citations(ctx, reply["gotchas"], "gotcha", notes))]
+    gaps = [f"{_code(p)} not shown to the model" for p in ch.not_shown] + notes
+    return "\n\n".join(parts + _footer(ctx, ch, gaps)) + "\n", gaps
+
+
+def _index_md(ctx: _Ctx, index_reply: dict | None) -> tuple[str, list[str]]:
+    notes: list[str] = []
+    parts = [f"# {_line(Path(ctx.repo).name)}"]
+    if index_reply is None:
+        notes.append("index generation failed")
+        parts.append("Overview unavailable — index generation failed.")
+    else:
+        parts.append(ctx.clean(index_reply["overview"]))
+        if block := _mermaid_block(index_reply["diagram"], ctx.home, ctx.repo):
+            parts.append(block)
+        else:
+            notes.append("diagram omitted: " + ("possible secret" if scan_secret(index_reply["diagram"])
+                                                 else "not Mermaid"))
+    rows = ["| # | Chapter | Why now |", "|---|---|---|"]
+    for i, ch in enumerate(ctx.chapters, 1):
+        why = index_reply["why"][i - 1] if index_reply else ch.why
+        rows.append(f"| {i:02d} | {_chlink(ctx, i, ch, numbered=False)} | {_cell(ctx.clean(why))} |")
+    parts += ["## Reading order", "\n".join(rows),
+              "Every file and where it is covered: [FILES.md](FILES.md). "
+              "What the labels check, and what could not be checked: [UNCERTAINTIES.md](UNCERTAINTIES.md)."]
+    return "\n\n".join(parts) + "\n", notes
+
+
+def _files_md(ctx: _Ctx, catalog: dict[str, CatalogRow], exclusions: dict[str, str], disc: Discovery) -> str:
+    chs = list(enumerate(ctx.chapters, 1))
+    owner = {p: _chlink(ctx, i, c) for i, c in chs for p in c.primary}
+    tests: dict[str, list[str]] = {}
+    for a, b in sorted(ctx.graph.edges):
+        if is_test(a):
+            tests.setdefault(b, []).append(a)
+    groups: dict[str, list[str]] = {}
+    for p in disc.included:
+        groups.setdefault(p.split("/")[0] + "/" if "/" in p else "./", []).append(p)
+    parts = ["# Files"]
+    for g in sorted(groups):
+        rows = ["| File | Purpose | Primary chapter | Related chapters | Tests | Imported by (count) |",
+                "|---|---|---|---|---|---|"]
+        for p in groups[g]:
+            row = catalog.get(p)
+            rel = ", ".join(_chlink(ctx, i, c) for i, c in chs if p in c.related) or "—"
+            rows.append(f"| {_code(p)} | {_cell(ctx.clean(row.purpose)) if row else ''} | {owner.get(p, '—')} "
+                        f"| {rel} | {', '.join(map(_code, tests.get(p, []))) or '—'} "
+                        f"| {ctx.graph.fan_in.get(p, 0)} |")
+        parts += [f"## {g}", "\n".join(rows)]
+    parts += ["## Excluded from narrative",
+              "\n".join(f"- {_code(p)} — {r}" for p, r in sorted(exclusions.items())) or "none",
+              "## Skipped"]
+    for reason, paths in sorted(disc.skipped.items()):
+        parts += [f"### {reason}", "\n".join(f"- {_code(p)}" for p in sorted(paths))]
+    if not disc.skipped:
+        parts.append("none")
+    return "\n\n".join(parts) + "\n"
+
+
+def _uncertainties_md(ctx: _Ctx, gaps: dict[int, list[str]], index_notes: list[str],
+                      catalog: dict[str, CatalogRow]) -> str:
+    def items(xs: list[str]) -> str:
+        return "\n".join(f"- {x}" for x in xs) or "- nothing recorded"
+    parts = ["# Uncertainties", LIMIT_SENTENCE]
+    for i, ch in enumerate(ctx.chapters, 1):
+        parts += [f"## {i:02d}. {_line(ctx.clean(ch.title))}", items(gaps[i])]
+    if index_notes:
+        parts += ["## Index", items(index_notes)]
+    failed = [f"{_code(p)} — catalog failed" for p, r in sorted(catalog.items()) if r.failed]
+    parts += ["## Catalog failures", items(failed), "## Label legend",
+              "\n".join(["| Label | Meaning |", "|---|---|"]
+                        + [f"| `{k}` | {v} |" for k, v in LABEL_MEANINGS.items()])]
+    return "\n\n".join(parts) + "\n"
+
+
+def _coverage(ctx: _Ctx, catalog: dict[str, CatalogRow], exclusions: dict[str, str], disc: Discovery) -> dict:
+    primary = {p for c in ctx.chapters for p in c.primary}
+    related = {p for c in ctx.chapters for p in c.related}
+    full, part = set(), set()
+    for c in ctx.chapters:
+        for p, ranges in c.shown.items():
+            (full if [tuple(r) for r in ranges] == [(1, len(ctx.lines(p)))] else part).add(p)
+    return {"discovered": len(disc.discovered), "included": len(disc.included),
+            "catalogued": sum(not r.failed for r in catalog.values()), "primary": len(primary),
+            "related_only": len(related - primary), "excluded": dict(sorted(Counter(exclusions.values()).items())),
+            "shown_full": len(full), "shown_partial": len(part - full),
+            "skipped": {r: len(ps) for r, ps in sorted(disc.skipped.items())}}
+
+
+def render_book(chapters: list[Chapter], replies: dict[str, dict | None], index_reply: dict | None, snap: Snapshot,
+                graph: Graph, catalog: dict[str, CatalogRow], exclusions: dict[str, str], disc: Discovery,
+                gi: GitInfo, stats: dict, backend: Backend, probe_result: str, run_id: str, *,
+                files_changed: Sequence[str] = ()) -> dict[str, str]:
+    """Renders the book deterministically from validated replies.
+
+    Contract:
+    - Returns {filename relative to docs/architecture/: content}; Markdown starts with the v3 marker.
+    - A None chapter reply renders a file-list stub; a None index reply renders a fallback overview.
+    Limits: replies must already pass validate_chapter_reply / the index validator (paths, types).
+    """
+    ctx = _Ctx(chapters, snap, graph, gi, str(Path.home()), str(disc.root.resolve()))
+    head = f"<!-- {MARKER} run={run_id} -->\n"
+    out, gaps = {}, {}
+    for i, ch in enumerate(chapters, 1):
+        md, gaps[i] = _render_chapter(ctx, i, ch, replies.get(ch.slug))
+        out[_fname(i, ch)] = head + md
+    index, index_notes = _index_md(ctx, index_reply)
+    out["INDEX.md"] = head + index
+    out["FILES.md"] = head + _files_md(ctx, catalog, exclusions, disc)
+    out["UNCERTAINTIES.md"] = head + _uncertainties_md(ctx, gaps, index_notes, catalog)
+    prov = {"generator": MARKER, "run_id": run_id,
+            "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "commit": gi.commit, "branch": gi.branch, "dirty": gi.dirty,
+            "source_manifest_sha256": snap.manifest_sha256, "files_changed_during_run": list(files_changed),
+            "backend": {"argv": backend.argv, "fingerprint": backend.fingerprint, "sandbox": backend.sandbox,
+                        "allow_rules": backend.allow_rules, "probe": probe_result},
+            "stage_versions": STAGE_VERSIONS, "calls_by_stage": stats.get("calls_by_stage", {}),
+            "cache_hits_by_stage": stats.get("cache_hits_by_stage", {}),
+            "coverage": _coverage(ctx, catalog, exclusions, disc)}
+    out["provenance.json"] = json.dumps(prov, indent=2, ensure_ascii=False) + "\n"
+    return out
 
 
 @dataclass(frozen=True)
