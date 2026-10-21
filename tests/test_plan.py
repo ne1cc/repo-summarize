@@ -237,3 +237,24 @@ def test_reask_contains_violations(rs):
     fake = _FakeRunner([json.loads(json.dumps(_good()[:3])), _good()])
     _, how = rs.run_plan(_cat(rs, FILES), _graph(rs), "", fake, None, False)
     assert how == "model" and "Your previous reply was rejected: missing role contributing" in fake.prompts[1]
+
+
+def test_prompts_state_no_tools(rs):
+    assert rs.NO_TOOLS in rs.plan_prompt(_cat(rs, FILES), _graph(rs), "# hi")
+    assert rs.plan_prompt(_cat(rs, FILES), _graph(rs), "# hi").split("\n")[1] == rs.NO_TOOLS
+
+
+def test_plan_reask_after_tool_denied(rs):
+    prompts, replies = [], [rs.CallFailed("tool-denied"), json.dumps(_good())]
+
+    class R:
+        def ask_json(self, stage, prompt):
+            prompts.append(prompt)
+            r = replies.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return json.loads(r)
+    chapters, how = rs.run_plan(_cat(rs, FILES), _graph(rs), "# hi", R(), None, False)
+    assert how == "model" and rs.TOOL_RETRY in prompts[1] and rs.TOOL_RETRY not in prompts[0]
+    assert "backend call failed" not in prompts[1]
+    assert len(prompts[1].encode()) <= rs.PROMPT_LIMIT

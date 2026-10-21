@@ -158,3 +158,17 @@ def test_bad_timeout_is_usage(rs, tool, monkeypatch):
     repo = tool.repo()
     monkeypatch.setenv("REPO_SUMMARIZE_TIMEOUT", "soon")
     assert rs.main([str(repo)]) == rs.EXIT_USAGE
+
+
+def test_e2e_tool_denied_degrades_not_aborts(rs, tool):
+    denied = "jetski: no output produced - a tool required permission, so it was auto-denied."
+    repo = tool.repo()
+    tool.scenario(book_scenario(stderr_by_stage={"plan": [denied], "chapter": [denied, denied, ""]}))
+    code, calls = tool.run(repo)
+    assert code == rs.EXIT_OK
+    arch = repo / ARCH
+    assert (arch / "INDEX.md").is_file()
+    assert calls.count("plan") >= 2 and calls.count("chapter") >= 3
+    unc = (arch / "UNCERTAINTIES.md").read_text()
+    assert "generation failed; this chapter lists its files only" in unc
+    assert sum("lists its files only" in p.read_text() for p in arch.glob("[0-9][0-9]-*.md")) == 1

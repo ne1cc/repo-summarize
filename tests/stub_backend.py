@@ -46,6 +46,9 @@ def main():
         return 1
     if scenario.get("stderr"):
         sys.stderr.write(scenario["stderr"])
+    per_call = scenario.get("stderr_by_stage", {}).get(stage)  # per-call stderr, consumed like reply lists
+    if per_call:
+        sys.stderr.write(per_call[min(seen, len(per_call) - 1)])
     reply = scenario.get(stage, "")
     if isinstance(reply, list):
         reply = reply[min(seen, len(reply) - 1)] if reply else ""

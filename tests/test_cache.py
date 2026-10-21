@@ -141,3 +141,25 @@ def test_extract_json_nested_is_fast(rs):
 def test_extract_json_deep_fenced_block(rs):
     deep = "[" * 16000 + "]" * 16000
     assert rs.extract_json(f"```json\n{deep}\n```\nActually: {{\"a\":1}}") == {"a": 1}
+
+
+def test_tool_denied_does_not_trip_breaker(rs, mk):
+    r, _ = mk({"chapter": "", "stderr": "jetski: tool was auto-denied"})
+    for i in range(rs.BREAKER + 2):
+        with pytest.raises(rs.CallFailed) as e:
+            r.ask("chapter", f"STAGE: chapter\n{i}")
+        assert e.value.reason == "tool-denied"
+
+
+def test_tool_denied_neither_counts_nor_resets(rs, mk, monkeypatch):
+    r, _ = mk({})
+    seq = iter(["exit 1", "exit 1", "tool-denied", "exit 1"])
+
+    def fake(b, p):
+        raise rs.CallFailed(next(seq))
+    monkeypatch.setattr(rs, "call", fake)
+    for i in range(3):
+        with pytest.raises(rs.CallFailed):
+            r.ask("chapter", f"STAGE: chapter\n{i}")
+    with pytest.raises(rs.Aborted):
+        r.ask("chapter", "STAGE: chapter\nlast")

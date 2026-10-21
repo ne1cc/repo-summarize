@@ -85,3 +85,24 @@ def test_many_small_files_prompt_under_limit(rs, tmp_path):
     batches = rs.catalog_batches(_snap(rs, tmp_path, files), list(files))
     assert sum(len(b) for b in batches) == len(files)
     assert all(len(rs.catalog_prompt(b).encode()) < rs.PROMPT_LIMIT for b in batches)
+
+
+def test_catalog_prompt_states_no_tools(rs):
+    assert rs.catalog_prompt([("a.py", "x", False)]).split("\n")[1] == rs.NO_TOOLS
+
+
+def test_catalog_reask_after_tool_denied(rs, tmp_path):
+    prompts = []
+
+    class R:
+        def ask(self, stage, prompt):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                raise rs.CallFailed("tool-denied")
+            return '{"path": "a.py", "purpose": "does a thing", "symbols": []}'
+    snap_dir = tmp_path
+    (snap_dir / "a.py").write_text("print(1)\n")
+    snap = rs.Snapshot(snap_dir, {}, "")
+    rows = rs.run_catalog(snap, ["a.py"], R())
+    assert not rows["a.py"].failed
+    assert rs.TOOL_RETRY in prompts[1] and rs.TOOL_RETRY not in prompts[0]
