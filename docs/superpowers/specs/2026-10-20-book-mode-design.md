@@ -27,6 +27,9 @@ docs/architecture/
   01-<slug>.md …      6–12 chapters, read in order
   FILES.md            every file: purpose, key symbols, chapter, tests, imported-by
   reference/<path>.md only with --reference (per-file annotated walkthroughs, today's output)
+  UNCERTAINTIES.md    what could not be verified: dropped refs, flagged citations, uncovered files,
+                      DeepWiki claims not supported locally (§5.6)
+  provenance.json     commit, dirty flag, generated_at, backend, prompt versions, DeepWiki use (§5.6)
   .repo-map.md  .repo-edges.tsv  .cache/  .progress.json  .repo-summarize.log
 ```
 
@@ -46,7 +49,7 @@ docs/architecture/
 Files in this chapter / Tests          ← script-generated footer
 ```
 
-Chapter 01 is always **Orientation** (what it is, stack, layout, how to install, run, test, build). The last chapter is always **Contributing** (CI gates, conventions, PR flow).
+Chapter 01 is always **Orientation** (what it is, stack, layout, how to install, run, test, build). Chapter 02 is always **The main flow**: one end-to-end path (an input becoming an output) across files, with every step backed by a pasted local excerpt. The last chapter is always **Contributing** (CI gates, conventions, PR flow).
 
 ### INDEX.md
 
@@ -61,6 +64,7 @@ Grouped by top-level directory: `File | Purpose | Key symbols | Chapter | Tests 
 | # | Stage | AI calls | Input → Output |
 |---|---|---|---|
 | 0 | Scan | 0 | files, import edges, entry points, manifest commands → `.repo-map.md`, `.repo-edges.tsv` |
+| 0b | DeepWiki research (opt-in, §5.6) | 0 (HTTP only) | repo name → topic tree, page slices, 3 answers (external, unverified) |
 | 1 | Catalog | ⌈source bytes / 60 KB⌉ | batched file contents → one row per file: `path⇥purpose⇥symbols` |
 | 2 | Plan | 1 | README head + edges + catalog → `NN⇥slug⇥title⇥why⇥files` |
 | 3 | Attach | 0 | deterministic placement fixes (§6.2) |
@@ -123,6 +127,48 @@ Every model stage follows **validate → retry once, listing the violations → 
 
 One call. Prompt: chapter list, each chapter's "What this is" section, top-level directory edges, README head. Validated for headings and Mermaid; links are added by the script.
 
+### 5.6 DeepWiki research (optional, `--deepwiki`)
+
+**Role**: DeepWiki *suggests* topics, flows and file relationships. The local checkout is the only source of truth, and nothing reaches a chapter without a local citation that passes §6.3. DeepWiki never replaces the catalog, the per-file docs, or the planner.
+
+**Transport**: the script speaks MCP itself, using `curl` + `jq` JSON-RPC `tools/call` against `https://mcp.deepwiki.com/mcp` (Streamable HTTP, replies arrive as SSE `data:` lines). The `agy` backend gets no tools and no MCP access. `REPO_SUMMARIZE_DEEPWIKI_URL` overrides the endpoint; tests point it at a stub.
+
+**Eligibility.** Every check must pass, or the step is skipped with a logged reason:
+1. The `--deepwiki` flag is given. It is off by default: the repo name leaves the machine.
+2. `origin` is a `github.com` remote. Credentials embedded in the remote URL are stripped and never written anywhere.
+3. The repo is publicly reachable: an unauthenticated `GET https://api.github.com/repos/<o>/<r>` returns 200. A private repo's name is never sent.
+4. DeepWiki has the repo indexed. The "Repository not found" reply means skip, with a pointer to `deepwiki.com/<o>/<r>` for indexing.
+
+**What is sent**: the repo name and three fixed questions only. Never source, catalog text, secrets, env values, or uncommitted changes.
+
+**Calls** (once per run, cached by retrieval date; no `agy` quota used):
+1. `read_wiki_structure` → topic tree (about 2 KB), passed to the planner as "external topic hints (unverified)".
+2. `read_wiki_contents` → split into pages on its page headings. Each chapter prompt gets at most 15 KB of the 1–2 best-matching pages, matched by file paths shared between the page's `Sources:` lines and the chapter's files. Labelled "external notes, may describe a different commit; verify against the source below, cite only local lines."
+3. `ask_wiki_question` × 3 (the real tool name; it was `ask_question` in the request). The questions:
+   - What are the main components and entry points?
+   - Describe one representative end-to-end flow, and which files implement each step.
+   - How do developers run, test, and debug it locally?
+
+   Answers go to the planner (topics, the main flow for chapter 02) and to chapter 01.
+
+**Local verification** (no AI). Each DeepWiki claim gets one label: `verified` / `external-only` / `inferred` / `conflicting`.
+- **Cited sources** `path:A-B`: the path exists locally and the range is in bounds → `verified`. The path is missing or out of range → `conflicting`, which usually means DeepWiki indexed an older commit.
+- **Flow answer**: for each consecutive file pair, an import-edge path of length ≤ 2 exists → `verified`. A path exists but is longer → `inferred`. No path → `external-only`.
+- **Chapter 02 must include ≥ 1 flow** where every step has a resolved local ref. If the DeepWiki flow cannot be verified, chapter 02 falls back to the flow from the local entry point.
+
+Labels are recorded in UNCERTAINTIES.md. Only `verified` relationships appear in chapters.
+
+**Failure**: any HTTP error, timeout (60 s per call) or malformed reply → log it, set `deepwiki.used=false` with the reason, and continue fully local. DeepWiki never fails a run.
+
+### 5.7 UNCERTAINTIES.md and provenance.json (no AI)
+
+- **UNCERTAINTIES.md** is generated from run state:
+  - per chapter: dropped refs, flagged or corrected citations, "partially shown" files;
+  - files not covered by any chapter;
+  - catalog failures;
+  - DeepWiki claims labelled `external-only`, `inferred` or `conflicting`, each with what was checked.
+- **provenance.json**: `{ commit, dirty, branch, generated_at (ISO 8601 with offset), backend_cmd (no secrets), prompt_versions, calls_by_stage, deepwiki: { used, skipped_reason, retrieved_at, pages_used, questions } }`. `retrieved_at` is when DeepWiki was queried. It is never presented as the commit DeepWiki describes.
+
 ## 6. Verification (the trust layer)
 
 ### 6.1 Structure
@@ -184,7 +230,9 @@ repo-summarize [path]          book mode (default)
   --estimate | --dry-run | --status | --open
   --force                      ignore cache      --replan   re-plan only
   --max-calls N
-env: REPO_SUMMARIZE_CMD (default "agy -p"), REPO_SUMMARIZE_TIMEOUT (default 300)
+  --deepwiki                   optional external research for public, DeepWiki-indexed repos (§5.6)
+env: REPO_SUMMARIZE_CMD (default "agy -p"), REPO_SUMMARIZE_TIMEOUT (default 300),
+     REPO_SUMMARIZE_DEEPWIKI_URL (default https://mcp.deepwiki.com/mcp)
 ```
 
 - Option values are validated: a missing or non-integer value gives a message and exit 2 (fixes F6).
@@ -208,6 +256,11 @@ env: REPO_SUMMARIZE_CMD (default "agy -p"), REPO_SUMMARIZE_TIMEOUT (default 300)
   - Dry-run leaves `git status` clean.
   - Cache: touch → no calls; edit a file → only its catalog row plus its chapter regenerate.
   - `--max-calls` stops and resumes.
+  - DeepWiki, against a stub at `REPO_SUMMARIZE_DEEPWIKI_URL`:
+    - each source citation gets the right label (`verified` / `conflicting`);
+    - a flow with an unreachable file pair gets `external-only`, and chapter 02 falls back to the local flow;
+    - "Repository not found", an HTTP 500 and a private repo all skip with a reason, and the run still succeeds;
+    - the request bodies contain only the repo name and the fixed questions.
   - The circuit breaker trips on 3 failures.
   - The timeout kills a sleeping stub.
 - Manual acceptance on lakehouse-engine (real `agy`, about 20 calls):
@@ -220,7 +273,10 @@ env: REPO_SUMMARIZE_CMD (default "agy -p"), REPO_SUMMARIZE_TIMEOUT (default 300)
 - **Book by default, per-file docs opt-in.** Per-file line annotation was costly (about 1 call per file) and padded. *Rejected*: keeping both by default.
 - **The script pastes code; the model only cites.** This removed invented code in the spike and cuts output tokens.
 - **Plan from a cheap AI catalog**, not from pure heuristics (the planner would be blind) and not from a directory map-reduce (more calls, lossy). The map-reduce idea survives only as the >80 KB catalog fallback (§5.2).
-- **Short claims with `path:line`**, not Claim/Evidence/Status blocks, which conflict with the no-fluff goal.
+- **Short claims with `path:line`**, not Claim/Evidence/Status blocks, which conflict with the no-fluff goal. The four evidence labels live only in UNCERTAINTIES.md.
+- **DeepWiki via the script's own `curl` MCP client**, not as tools given to `agy`. Letting the agent call MCP tools would need tool permissions in headless mode, which is exactly what the yolo concern is about. *Rejected*: scraping deepwiki.com, and feeding whole `read_wiki_contents` output (1.17 MB for sqlmesh) to the model.
+- **DeepWiki opt-in, not automatic.** Even for public repos the repo name leaves the machine, and most new or personal repos aren't indexed. In the 2026-10-20 probe, `ne1cc/lakehouse-engine` (private) and `sqlmesh/sqlmesh` (wrong org name) returned "Repository not found"; `TobikoData/sqlmesh` returned a 25-page tree.
+- **Kept the book layout** (chapters, FILES.md) rather than `architecture.md` + `modules/` + `flows/` directories. Chapters already serve as module pages, and chapter 02 is the verified flow. Added UNCERTAINTIES.md and provenance.json as proposed.
 
 ## 14. Open questions
 
