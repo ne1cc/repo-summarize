@@ -180,7 +180,10 @@ def take_snapshot(disc: Discovery, run_dir: Path) -> Snapshot:
 
 
 def read_snapshot(snap: Snapshot, path: str) -> list[str]:
-    return (snap.dir / path).read_bytes().decode("utf-8", "replace").splitlines()
+    lines = (snap.dir / path).read_bytes().decode("utf-8", "replace").split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    return [ln.removesuffix("\r") for ln in lines]
 
 
 def changed_since_snapshot(disc: Discovery, snap: Snapshot) -> list[str]:

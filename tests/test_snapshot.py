@@ -7,7 +7,7 @@ def test_redact_keeps_line_count(rs):
     pem = "-----BEGIN RSA PRIVATE KEY-----\nAAAA\nBBBB\nCCCC\n-----END RSA PRIVATE KEY-----"
     text = "a\nb\n" + pem + "\nc\nd\n"
     out, n = rs.redact_text(text)
-    assert len(out.splitlines()) == len(text.splitlines()) == 9
+    assert len(out.split("\n")) == len(text.split("\n")) == 10
     assert out.split("\n")[2:7] == ["[REDACTED]"] * 5
     assert n >= 1
 
@@ -56,3 +56,11 @@ def test_changed_since_snapshot(rs, make_repo, tmp_path):
     (repo / "a.py").write_text("x=2\n")
     (repo / "c.py").unlink()
     assert rs.changed_since_snapshot(d, s) == ["a.py", "c.py"]
+
+
+def test_read_snapshot_splits_on_newline_only(rs, make_repo, tmp_path):
+    files = {"a.py": b"a\x0cb\nc\n", "b.py": "a\u2028b\n".encode(), "c.py": b"a\r\nb\r\n"}
+    s = rs.take_snapshot(rs.discover(make_repo(tmp_path, files)), tmp_path / "run")
+    assert rs.read_snapshot(s, "a.py") == ["a\x0cb", "c"]
+    assert len(rs.read_snapshot(s, "b.py")) == 1
+    assert rs.read_snapshot(s, "c.py") == ["a", "b"]
