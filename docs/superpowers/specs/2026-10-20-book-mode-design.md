@@ -82,7 +82,7 @@ The tool builds every link.
 | # | Stage | AI calls | Output |
 |---|---|---|---|
 | 0 | Discover + snapshot | 0 | snapshot, coverage counts, edges, entry points, manifest commands |
-| 1 | Backend probe | 1 (cached per backend command, 24 h) | isolation verdict (§10) |
+| 1 | Backend probe | 1 only when the backend command or version changes, else 0 | isolation verdict (§10) |
 | 2 | Catalog | ⌈source bytes / 60 KB⌉ | `path → purpose, symbols` |
 | 3 | Plan | 1 | chapters, primary files, related files |
 | 4 | Attach | 0 | final placement; tests; budgets checked |
@@ -255,7 +255,7 @@ At discovery, every included file is copied into `runs/<id>/snapshot/` and its s
 ### 10.2 Backend isolation (fails closed)
 - **Calls**: `subprocess.run([...cmd, prompt], cwd=<empty temp dir>, env=<minimal>, timeout=REPO_SUMMARIZE_TIMEOUT)`. The minimal environment is `PATH`, `HOME`, `LANG`, `TMPDIR`, plus names listed in `REPO_SUMMARIZE_PASS_ENV`.
 - **Default command**: `agy -p --disable-slash-commands`. If the 1-call trial in the implementation plan shows `--sandbox` and/or `--mode plan` still return plain text, they're added as well.
-- **Isolation probe**: once per backend command, cached for 24 h. The prompt asks the backend to create `<probe-dir>/canary` and to read a sentinel file outside its working directory.
+- **Isolation probe**: runs when the cached verdict's key `sha256(backend command ‖ backend version)` changes. The version is the output of `<cmd[0]> --version` (`agy` prints e.g. `1.4.3`). If that fails, it's the binary's resolved path + size + mtime. An `agy` update therefore triggers a re-probe. The prompt asks the backend to create `<probe-dir>/canary` and to read a sentinel file outside its working directory.
   - If the canary file appears, or the reply contains the sentinel's random token: the verdict is `unsafe`, and the run **aborts** unless `--unsafe-backend` is given.
   - If the reply is a refusal or plain text: `isolated-by-probe`.
   - The verdict is recorded in provenance.
@@ -332,7 +332,29 @@ At discovery, every included file is copied into `runs/<id>/snapshot/` and its s
 - **DeepWiki dropped.** It added remote transport, eligibility rules and a second evidence model before the local book was proven. The user's repos are private or not indexed anyway. The 2026-10-20 probe (curl MCP works; the tools are `read_wiki_structure`, `read_wiki_contents`, `ask_wiki_question`) is recorded here in case it's revisited.
 - **One primary chapter per file**, plus a related list and many-to-many `tests_for`.
 
-## 15. Open questions
+## 15. CLI
 
-1. Should `--reference` default to the top-N files by fan-in instead of every file?
-2. The isolation probe costs one call per backend command per day. Is that acceptable, or should it run only on the first run and whenever the command changes?
+```
+repo-summarize [path]            build and publish the book
+  --reference [all]              also write per-file walkthroughs to reference/:
+                                 default = top 20 files by import fan-in (ties: entry points first, then path);
+                                 "all" = every included file
+  --estimate                     calls per stage + prompt KB; no AI calls, no writes
+  --dry-run                      discovery + coverage only; no writes
+  --status                       progress of the current or last run
+  --max-calls N                  stop before call N+1; exit 4; no publish; re-run resumes
+  --force                        ignore the generation cache      --replan   ignore the plan reuse policy
+  --open                         open INDEX.md after publishing
+  --unsafe-backend               allow a backend that failed the probe or uses yolo flags
+env: REPO_SUMMARIZE_CMD      (default "agy -p --disable-slash-commands")
+     REPO_SUMMARIZE_TIMEOUT  (seconds per call, default 300)
+     REPO_SUMMARIZE_PASS_ENV (extra env var names passed to the backend)
+```
+
+- Option values are validated: a missing or non-integer value prints usage and exits 2.
+- `--filter` and `--max-files` from v1 are removed. Partial runs are what made v1 overwrite a full INDEX.
+
+## 16. Resolved questions
+
+1. **`--reference` scope** (2026-10-20): the default is the top 20 files by fan-in, because walkthroughs cost 1 call per file and `FILES.md` already covers every file in one line. `--reference all` covers everything.
+2. **Probe frequency** (2026-10-20): re-probe only when the backend command or version changes. That costs no recurring calls and still catches backend updates.
