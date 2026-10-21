@@ -592,7 +592,7 @@ build_file_prompt() {
 Rules:
 - Ground every statement in the source or the context above. If something cannot be determined from them (for example the behaviour of a file that is not shown), write "unknown" instead of guessing.
 - Do not invent callers, callees, flags, or behaviour.
-- Draw every diagram (architecture, data flow, sequence, state, dependency tree) as Mermaid in its own ${fence}mermaid block. Never use ASCII or box-drawing art. Quote node labels that contain punctuation, e.g. A["load()"].
+- Draw every diagram (architecture, data flow, sequence, state, dependency tree) as Mermaid in its own ${fence}mermaid block. Never use ASCII or box-drawing art. Quote node labels that contain punctuation, e.g. A["load()"]. Never use a Mermaid keyword (end, off, alt, opt, loop, par, graph) as a node or participant ID.
 - Output ONLY the Markdown sections specified above. No preamble, no closing remarks, and do not wrap the whole document in one code block.
 EOS
 
@@ -848,7 +848,7 @@ Your task: write a comprehensive INDEX.md that:
 Per-file summaries:
 $ALL_SUMMARIES
 
-Draw every diagram as Mermaid in its own \`\`\`mermaid block, never ASCII or box-drawing art, and quote node labels that contain punctuation.
+Draw every diagram as Mermaid in its own \`\`\`mermaid block, never ASCII or box-drawing art, and quote node labels that contain punctuation. Never use a Mermaid keyword (end, off, alt, opt, loop, par, graph) as a node or participant ID.
 
 Write in clean GitHub-Flavored Markdown. Make this the definitive architectural reference for a new engineer joining the project.
 EOF
