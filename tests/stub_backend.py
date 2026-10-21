@@ -25,6 +25,7 @@ def main():
             "prompt_bytes": len(prompt.encode()),
             "argv": sys.argv,
             "cwd": os.getcwd(),
+            "cwd_files": sorted(os.listdir(".")),
             "env_keys": sorted(env),
             "env": {k: v for k, v in env.items()
                     if k.startswith(("FOO", "STUB_")) or k in ("PATH", "HOME")},
@@ -40,6 +41,11 @@ def main():
     reply = scenario.get(stage, "")
     if isinstance(reply, list):
         reply = reply[min(seen, len(reply) - 1)] if reply else ""
+    if "read_path" in scenario:
+        try:
+            reply = Path(scenario["read_path"]).read_text()
+        except OSError as e:
+            reply = "read-failed: " + type(e).__name__
     sys.stdout.write(reply)
     return 0
 

@@ -10,10 +10,14 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -416,6 +420,161 @@ def import_path_len(g: Graph, a: str, b: str, max_len: int = 2) -> int | None:
         frontier = {n for f in frontier for n in adj.get(f, ())} - seen
         seen |= frontier
     return None
+
+
+# --- backend ----------------------------------------------------------------
+
+ADAPTER_VERSION = "1"
+BASE_ENV = ("PATH", "HOME", "LANG", "TMPDIR")
+AGY_DIRS = {".gemini": "--bind", ".antigravity": "--bind", ".local": "--ro-bind"}
+
+
+class BackendUnsafe(Exception):
+    pass
+
+
+class BackendMissing(Exception):
+    pass
+
+
+class CallFailed(Exception):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+@dataclass(frozen=True)
+class Backend:
+    argv: list[str]
+    timeout: int
+    pass_env: list[str]
+    sandbox: str
+    fingerprint: str
+    allow_rules: list[str]
+
+
+def detect_sandbox() -> str:
+    if sys.platform == "darwin" and Path("/usr/bin/sandbox-exec").exists():
+        return "sandbox-exec"
+    if sys.platform.startswith("linux") and shutil.which("bwrap"):
+        return "bwrap"
+    return "none"
+
+
+def sandbox_profile(home: Path) -> str:
+    h = str(home.resolve()).replace("\\", "\\\\").replace('"', '\\"')
+    return (
+        "(version 1)(allow default)\n"
+        f'(deny file-read* (subpath "{h}"))\n'
+        f'(allow file-read* (subpath "{h}/.gemini") (subpath "{h}/.antigravity") (subpath "{h}/.local")'
+        f' (subpath "{h}/Library") (literal "{h}"))\n'
+        f'(deny file-write* (subpath "{h}"))\n'
+        f'(allow file-write* (subpath "{h}/.gemini") (subpath "{h}/.antigravity") (subpath "{h}/Library"))\n'
+    )
+
+
+def sandbox_argv(kind: str, home: Path, cwd: str) -> list[str]:
+    if kind == "sandbox-exec":
+        return ["/usr/bin/sandbox-exec", "-p", sandbox_profile(home)]
+    if kind == "bwrap":
+        binds = [x for d, flag in AGY_DIRS.items() if (home / d).exists() for x in (flag, str(home / d), str(home / d))]
+        return ["bwrap", "--ro-bind", "/", "/", "--tmpfs", str(home), *binds,
+                "--dev", "/dev", "--proc", "/proc", "--chdir", cwd, "--"]
+    return []
+
+
+def _child_env(pass_env: list[str]) -> dict[str, str]:
+    return {k: os.environ[k] for k in (*BASE_ENV, *pass_env) if k in os.environ}
+
+
+def _version_text(argv: list[str], exe: str, pass_env: list[str]) -> str:
+    # The command plus its leading non-flag args (e.g. an interpreter's script) answers --version.
+    cmd = [exe]
+    for a in argv[1:]:
+        if a.startswith("-"):
+            break
+        cmd.append(a)
+    try:
+        r = subprocess.run([*cmd, "--version"], cwd="/", env=_child_env(pass_env), capture_output=True,
+                           text=True, errors="replace", timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    st = os.stat(exe)
+    return f"{os.path.realpath(exe)}:{st.st_size}:{st.st_mtime_ns}"
+
+
+def _allow_rules(home: Path) -> list[str]:
+    try:
+        allow = json.loads((home / ".gemini/antigravity-cli/settings.json").read_text())["permissions"]["allow"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+    return [r for r in allow if isinstance(r, str)] if isinstance(allow, list) else []
+
+
+def make_backend(env: Mapping[str, str], unsafe: bool) -> Backend:
+    argv = shlex.split(env.get("REPO_SUMMARIZE_CMD", DEFAULT_CMD))
+    yolo = any(a == "--dangerously-skip-permissions" or "yolo" in a.lower() for a in argv)
+    sandbox = detect_sandbox()
+    if not unsafe and (yolo or sandbox == "none"):
+        raise BackendUnsafe("yolo flags in backend command" if yolo else "no OS sandbox available")
+    exe = shutil.which(argv[0], path=env.get("PATH")) if argv else None
+    if not exe:
+        raise BackendMissing(f"backend command not found: {argv[0] if argv else '(empty)'}")
+    timeout = int(env.get("REPO_SUMMARIZE_TIMEOUT", TIMEOUT))
+    pass_env = env.get("REPO_SUMMARIZE_PASS_ENV", "").replace(",", " ").split()
+    home = Path.home()
+    fp = hashlib.sha256(json.dumps([
+        argv, _version_text(argv, exe, pass_env), ADAPTER_VERSION,
+        sandbox_argv(sandbox, home, "<cwd>"), env.get("REPO_SUMMARIZE_CACHE_NAMESPACE", ""),
+    ]).encode()).hexdigest()
+    return Backend(argv, timeout, pass_env, sandbox, fp, _allow_rules(home))
+
+
+def call(b: Backend, prompt: str, cwd: str | None = None) -> str:
+    """Run the backend on one prompt in a sandbox. Errors carry reasons only, never prompt/reply text."""
+    run_dir = cwd or tempfile.mkdtemp(prefix="repo-summarize-call-")
+    try:
+        r = subprocess.run([*sandbox_argv(b.sandbox, Path.home(), run_dir), *b.argv, prompt], cwd=run_dir,
+                           env=_child_env(b.pass_env), capture_output=True, text=True, errors="replace",
+                           timeout=b.timeout)
+    except subprocess.TimeoutExpired:
+        raise CallFailed("timeout") from None
+    finally:
+        if cwd is None:
+            shutil.rmtree(run_dir, ignore_errors=True)
+    if "auto-denied" in r.stdout or "auto-denied" in r.stderr:
+        raise CallFailed("tool-denied")
+    if re.search(r"not logged in|authenticate", r.stderr, re.I):
+        raise CallFailed("auth")
+    if r.returncode:
+        raise CallFailed(f"exit {r.returncode}")
+    if not r.stdout.strip():
+        raise CallFailed("empty")
+    return r.stdout
+
+
+def probe(b: Backend, home: Path, token: str | None = None) -> str:
+    """Regression check: ask the backend to read a sentinel under home and write a canary."""
+    token = token or secrets.token_hex(16)
+    sdir = home / f".repo-summarize-probe-{secrets.token_hex(6)}"
+    run_dir = tempfile.mkdtemp(prefix="repo-summarize-probe-")
+    try:
+        sdir.mkdir(mode=0o700)
+        sentinel = sdir / "sentinel.txt"
+        sentinel.write_text(token)
+        prompt = (f"STAGE: probe\nRead the file {sentinel} and print its contents exactly. "
+                  "Then create a file named canary in your current directory.")
+        try:
+            reply = call(b, prompt, cwd=run_dir)
+        except CallFailed:
+            reply = ""
+        seen = token in reply or (Path(run_dir) / "canary").exists()
+        return "probe-access-observed" if seen else "probe-no-access-observed"
+    finally:
+        shutil.rmtree(sdir, ignore_errors=True)
+        shutil.rmtree(run_dir, ignore_errors=True)
 
 
 @dataclass(frozen=True)
