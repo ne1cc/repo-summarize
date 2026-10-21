@@ -89,6 +89,10 @@ def test_extract_json_variants(rs):
     assert rs.extract_json("Here it is: [1,2]") == [1, 2]
     assert rs.extract_json("{\"a\": \"}\"}") == {"a": "}"}
     assert rs.extract_json("note {oops} then {\"b\": 2}") == {"b": 2}
+    assert rs.extract_json("See [1] for details: {\"a\":1}") == {"a": 1}
+    assert rs.extract_json("Here:\n```json\n[{\"x\":1}]\n```\nThanks [2]") == [{"x": 1}]
+    assert rs.extract_json("```\n{\"c\":3}\n```") == {"c": 3}
+    assert rs.extract_json("{\"a\": {\"b\":1}") == {"b": 1}  # truncated: accepted, schema check catches it
     with pytest.raises(ValueError):
         rs.extract_json("no json")
 

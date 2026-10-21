@@ -612,13 +612,22 @@ class Aborted(Exception):
 
 
 def extract_json(reply: str):
-    dec = json.JSONDecoder()
-    for m in re.finditer(r"[{\[]", reply):
+    for block in re.findall(r"```[^\n`]*\n(.*?)```", reply, re.S):
         try:
-            return dec.raw_decode(reply, m.start())[0]
+            return json.loads(block)
         except ValueError:
             continue
-    raise ValueError("no JSON value in reply")
+    dec, best = json.JSONDecoder(), None
+    for m in re.finditer(r"[{\[]", reply):
+        try:
+            val, end = dec.raw_decode(reply, m.start())
+        except ValueError:
+            continue
+        if best is None or end - m.start() > best[0]:
+            best = (end - m.start(), val)
+    if best is None:
+        raise ValueError("no JSON value in reply")
+    return best[1]  # a truncated outer value yields its inner one; schema validation downstream catches it
 
 
 def ensure_state_dir(root: Path) -> Path:
