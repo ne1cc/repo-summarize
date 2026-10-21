@@ -75,7 +75,10 @@ def book(rs, make_repo, tmp_path):
     stats = {"calls_by_stage": {"chapter": 4}, "cache_hits_by_stage": {"catalog": 1}}
     out = rs.render_book(chs, replies, index, snap, graph, catalog, {"empty.py": "empty"}, disc, gi, stats,
                          backend, "probe-no-access-observed", "RUN1", files_changed=["lib.py"])
-    return {"rs": rs, "out": out, "chs": chs, "snap": snap, "gi": gi, "repo": repo}
+    args = dict(chapters=chs, replies=replies, index_reply=index, snap=snap, graph=graph, catalog=catalog,
+                exclusions={"empty.py": "empty"}, disc=disc, gi=gi, stats=stats, backend=backend,
+                probe_result="probe-no-access-observed", run_id="RUN1")
+    return {"rs": rs, "out": out, "chs": chs, "snap": snap, "gi": gi, "repo": repo, "args": args}
 
 
 # --- labels ----------------------------------------------------------------
@@ -293,3 +296,76 @@ def test_wrap_mermaid_ported(rs):
     assert "```python" in out
     assert out[out.index("a.py -> b.py") - 1] == "```"
     assert out[0] == "## Summary"
+
+
+# --- fix round 1 -----------------------------------------------------------
+
+def _fenced(md):
+    """Lines outside any fence, and whether every fence closed."""
+    outside, fence = [], None
+    for ln in md.splitlines():
+        m = re.match(r"\s*(`{3,}|~{3,})", ln)
+        if fence is None and m:
+            fence = m[1]
+        elif fence is not None and m and m[1][0] == fence[0] and len(m[1]) >= len(fence):
+            fence = None
+        elif fence is None:
+            outside.append(ln)
+    return outside, fence is None
+
+
+def test_model_prose_cannot_break_structure(book):
+    rs, args = book["rs"], dict(book["args"])
+    reply = dict(args["replies"]["main-flow"], what_this_is="x\n```\n## y\n---\n~~~~\n===\n> q")
+    args["replies"] = dict(args["replies"], **{"main-flow": reply})
+    md = rs.render_book(**args)["02-main-flow.md"]
+    outside, closed = _fenced(md)
+    assert closed
+    assert "## Where to change things" in outside and "**Known gaps**:" in outside
+    assert not any(re.fullmatch(r"\s*(-{3,}|={3,})", ln) for ln in outside if ln != "---")
+    assert outside.count("---") == 1  # only the footer rule
+    assert not any(ln.startswith(">") and ln != "> One path." for ln in outside)
+
+
+def _cells(row):
+    return len(re.split(r"(?<!\\)\|", row))
+
+
+def test_table_cells_escaped(book):
+    rs, args = book["rs"], dict(book["args"])
+    chs = [rs.Chapter(c.role, c.slug, c.title, c.why, c.primary, c.related, c.tests, c.shown, c.not_shown)
+           for c in args["chapters"]]
+    chs[2].title = "a|b\\"
+    args["chapters"] = chs
+    args["catalog"] = dict(args["catalog"], **{"lib.py": rs.CatalogRow("lib.py", "x | y", [], False)})
+    args["index_reply"] = dict(args["index_reply"], why=["w1", "w|2", "w3", "w4"])
+    out = rs.render_book(**args)
+    for name in ("INDEX.md", "FILES.md"):
+        rows = [ln for ln in out[name].splitlines() if ln.startswith("|")]
+        tables, cur = [], []
+        for ln in out[name].splitlines() + [""]:
+            if ln.startswith("|"):
+                cur.append(_cells(ln))
+            elif cur:
+                tables.append(cur)
+                cur = []
+        assert rows and all(len(set(t)) == 1 for t in tables), name
+    assert r"[03. a\|b\\](03-core.md)" in out["FILES.md"]
+
+
+def test_subdir_permalink(rs, make_repo, tmp_path):
+    repo = make_repo(tmp_path, {"pkg/foo/a.py": "x\n"})
+    _git(repo, "remote", "add", "origin", "git@github.com:o/r.git")
+    gi = rs.git_info(repo / "pkg" / "foo", ["a.py"])
+    sha = _git(repo, "rev-parse", "HEAD")
+    assert gi.prefix == "pkg/foo/" and gi.clean_files == {"a.py"}
+    url, label = rs.source_link(gi, "a.py", 1, 2, "docs/architecture")
+    assert url == f"https://github.com/o/r/blob/{sha}/pkg/foo/a.py#L1-L2" and label == ""
+
+
+def test_non_github_remote_is_working_tree(rs, make_repo, tmp_path):
+    repo = make_repo(tmp_path, {"a.py": "x\n"})
+    _git(repo, "remote", "add", "origin", "https://gitlab.com/o/r.git")
+    gi = rs.git_info(repo, ["a.py"])
+    assert gi.github is None and gi.has_remote
+    assert rs.source_link(gi, "a.py", 1, 1, "docs/architecture") == ("../../a.py#L1-L1", WT)

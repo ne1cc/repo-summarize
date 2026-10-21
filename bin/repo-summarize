@@ -1535,6 +1535,8 @@ class GitInfo:
     dirty: bool
     github: tuple[str, str] | None
     clean_files: set[str]
+    prefix: str = ""  # root's path inside the repo, e.g. "pkg/foo/"; paths here are relative to root
+    has_remote: bool = False
 
 
 def _git_out(root: Path, *args: str) -> str | None:
@@ -1558,17 +1560,17 @@ def git_info(root: Path, included: list[str]) -> GitInfo:
     tracked = set((_git_out(root, "ls-files", "-z") or "").split("\0"))
     changed = set((_git_out(root, "diff", "--name-only", "--relative", "-z", "HEAD") or "").split("\0"))
     url = _git_out(root, "remote", "get-url", "origin")
+    prefix = (_git_out(root, "rev-parse", "--show-prefix") or "").strip()
     return GitInfo(commit, branch, dirty, parse_github(url) if url else None,
-                   {p for p in included if p in tracked and p not in changed})
+                   {p for p in included if p in tracked and p not in changed}, prefix, bool(url))
 
 
 def source_link(gi: GitInfo, path: str, a: int, b: int, rel_from: str) -> tuple[str, str]:
     """(url, label): a commit permalink for clean files on GitHub, else a relative working-tree link."""
     if gi.github and gi.commit and path in gi.clean_files:
         o, r = gi.github
-        return f"https://github.com/{quote(o)}/{quote(r)}/blob/{gi.commit}/{quote(path)}#L{a}-L{b}", ""
-    # shortcut: a non-GitHub origin is labelled (local) too, since GitInfo keeps only GitHub remotes
-    return f"{quote(posixpath.relpath(path, rel_from))}#L{a}-L{b}", WORKING_TREE if gi.github else "(local)"
+        return f"https://github.com/{quote(o)}/{quote(r)}/blob/{gi.commit}/{quote(gi.prefix + path)}#L{a}-L{b}", ""
+    return f"{quote(posixpath.relpath(path, rel_from))}#L{a}-L{b}", WORKING_TREE if gi.has_remote else "(local)"
 
 
 def _fence(text: str) -> str:
@@ -1588,7 +1590,7 @@ def _line(s: str) -> str:
 
 
 def _cell(s: str) -> str:
-    return _line(s).replace("|", "\\|")
+    return _line(s).replace("\\", "\\\\").replace("|", "\\|")
 
 
 def _label(label: str) -> str:
@@ -1664,8 +1666,10 @@ def _safe(s: str, home: str, repo: str) -> str:
 def clean_model_text(s: str, home: str, repo: str) -> str:
     """Model prose → plain text with inline code: no links, images, HTML or headings; secrets and home paths removed."""
     s = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", _safe(s, home, repo))
-    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    return re.sub(r"(?m)^([ \t]*)#+[ \t]*", r"\1", s)
+    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")  # also defuses a leading > quote
+    s = re.sub(r"(?m)^([ \t]*)#+[ \t]*", r"\1", s)
+    # A fence run would swallow the rest of the chapter; a -/= rule line would make a setext heading
+    return re.sub(r"(?m)^([ \t]*)(`{3,}|~{3,}|-{3,}[ \t]*$|={3,}[ \t]*$)", r"\1\\\2", s)
 
 
 def _mermaid_header(s: str) -> bool:
@@ -1786,7 +1790,7 @@ def _fname(i: int, ch: Chapter) -> str:
 
 
 def _link_text(s: str) -> str:
-    return s.replace("[", "\\[").replace("]", "\\]")
+    return _cell(s).replace("[", "\\[").replace("]", "\\]")
 
 
 def _chlink(ctx: _Ctx, i: int, ch: Chapter, numbered: bool = True) -> str:
