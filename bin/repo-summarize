@@ -576,6 +576,8 @@ def call(b: Backend, prompt: str) -> str:
         raise CallFailed("tool-denied")
     if re.search(r"not logged in|authenticate", r.stderr, re.I):
         raise CallFailed("auth")
+    if r.returncode in (126, 127):  # e.g. a wrapper script under a sandbox-denied path
+        raise CallFailed(f"exit {r.returncode}: cannot execute the backend command inside the sandbox")
     if r.returncode:
         raise CallFailed(f"exit {r.returncode}")
     if not r.stdout.strip():
@@ -707,7 +709,7 @@ class Runner:
             if self._denied >= TOOL_DENIED_BREAKER:
                 raise Aborted(f"the backend keeps trying to use tools ({TOOL_DENIED_BREAKER} consecutive denials)") from e
             if self._fails >= BREAKER:
-                raise Aborted(f"{BREAKER} consecutive backend failures") from e
+                raise Aborted(f"{BREAKER} consecutive backend failures (last: {e.reason})") from e
             raise
         self._fails = self._denied = 0
         self._store(path, reply)

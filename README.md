@@ -60,7 +60,7 @@ repo-summarize [path]     build and publish the book
 
 | Env | Default | Meaning |
 |---|---|---|
-| `REPO_SUMMARIZE_CMD` | `agy --disable-slash-commands -p` | Backend command, split like a shell; the prompt is appended as the last argument |
+| `REPO_SUMMARIZE_CMD` | `agy --disable-slash-commands -p` | Backend command, split like a shell; the prompt is appended as the last argument. Under the sandbox, the command and anything it runs must live outside `$HOME` or under `~/.local`, `~/.gemini`, `~/.antigravity` or `~/Library` (exit 126 otherwise) |
 | `REPO_SUMMARIZE_TIMEOUT` | `300` | Seconds per backend call |
 | `REPO_SUMMARIZE_PASS_ENV` | none | Extra environment variable names to pass to the backend (it otherwise gets only PATH, HOME, LANG, TMPDIR) |
 | `REPO_SUMMARIZE_CACHE_NAMESPACE` | none | Mixed into the cache key |

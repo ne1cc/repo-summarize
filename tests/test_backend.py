@@ -80,6 +80,7 @@ def test_timeout_and_failures(rs, backend):
     cases = [
         ({"sleep": 3, "chapter": "late"}, "timeout"),
         ({"exit_code": 1}, "exit 1"),
+        ({"exit_code": 126}, "exit 126: cannot execute the backend command inside the sandbox"),
         ({"stderr": "write_file auto-denied", "chapter": "x"}, "tool-denied"),
         ({"stderr": "Please authenticate first", "exit_code": 1}, "auth"),
         ({"stderr": "Error: Not logged in"}, "auth"),

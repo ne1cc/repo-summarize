@@ -66,7 +66,7 @@ def test_three_consecutive_failures_abort(rs, mk, tmp_path):
     for i in range(rs.BREAKER - 1):
         with pytest.raises(rs.CallFailed):
             r.ask("chapter", f"STAGE: chapter\n{i}")
-    with pytest.raises(rs.Aborted):
+    with pytest.raises(rs.Aborted, match=r"\(last: exit 1\)"):
         r.ask("chapter", "STAGE: chapter\nlast")
     assert not (tmp_path / "state" / "cache").exists() or not list((tmp_path / "state" / "cache").glob("*.txt"))
 
