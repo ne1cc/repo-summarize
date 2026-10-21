@@ -18,12 +18,13 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+import traceback
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_ABORT, EXIT_CAPPED, EXIT_UNSAFE = 0, 1, 2, 3, 4, 5
 
@@ -1991,6 +1992,177 @@ def render_book(chapters: list[Chapter], replies: dict[str, dict | None], index_
     return out
 
 
+# --- publish ----------------------------------------------------------------
+
+RESERVED = re.compile(r"(INDEX\.md|FILES\.md|UNCERTAINTIES\.md|provenance\.json|[0-9][0-9]-[^/]*\.md|reference/.*)")
+GENERATED_HEADS = (f"<!-- {MARKER}", f'"generator": "{MARKER}"', "<!-- repo-summarize:v2", "# Architecture Summary:")
+LINK_RE = re.compile(r"\[[^\]]*\]\(([^)\s]*)\)")
+
+
+class Locked(Exception):
+    pass
+
+
+class ReservedNameCollision(Exception):
+    pass
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def acquire_lock(state: Path) -> None:
+    """Takes state/lock (our PID). Raises Locked if a live process holds it; a stale lock is taken over.
+
+    Limits: shortcut: a reader can see the lock between create and PID write and treat it as stale,
+    upgrade to fcntl.flock if concurrent starts within milliseconds matter.
+    """
+    lock = state / "lock"
+    for _ in range(2):
+        try:
+            fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                pid = int(lock.read_text().strip())
+            except (OSError, ValueError):
+                pid = 0
+            if pid > 0 and _alive(pid):
+                raise Locked(f"another run is in progress (pid {pid})") from None
+            lock.unlink(missing_ok=True)
+            continue
+        with os.fdopen(fd, "w") as f:
+            f.write(str(os.getpid()))
+        return
+    raise Locked("another run is in progress (lock contended)")
+
+
+def release_lock(state: Path) -> None:
+    lock = state / "lock"
+    try:
+        if lock.read_text().strip() == str(os.getpid()):
+            lock.unlink()
+    except OSError:
+        pass
+
+
+def _journal(state: Path, run_id: str, step: str) -> None:
+    tmp = state / "publish.json.tmp"
+    tmp.write_text(json.dumps({"run": run_id, "step": step}))
+    os.replace(tmp, state / "publish.json")
+
+
+def recover(root: Path, state: Path) -> str | None:
+    """Finishes or undoes an interrupted publish (§10 step 6). Returns the action taken, or None."""
+    journal = state / "publish.json"
+    try:
+        doc = json.loads(journal.read_text())
+        run_id, step = str(doc["run"]), doc["step"]
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, KeyError, TypeError):
+        journal.unlink(missing_ok=True)
+        return "discarded an unreadable publish journal"
+    arch, prev = root / RENDER_DIR, state / "runs" / run_id / "previous"
+    # 1. moved-old with the book missing → the kill came between the renames; put the old book back
+    if step == "moved-old" and not arch.exists() and prev.exists():
+        prev.rename(arch)
+        action = f"restored {RENDER_DIR} from run {run_id}"
+    else:  # prepared → nothing moved yet; done (or moved-old with the new book in place) → finished
+        action = f"cleared publish journal of run {run_id} (step {step})"
+    journal.unlink()
+    return action
+
+
+def _handwritten(arch: Path) -> list[str]:
+    """Files in arch without a v1/v2/v3 generator marker in their first 3 lines (posix paths relative to arch)."""
+    out = []
+    for p in sorted(arch.rglob("*")) if arch.is_dir() else []:
+        if p.is_dir() and not p.is_symlink():
+            continue
+        try:
+            with p.open(errors="replace") as f:
+                head = [f.readline() for _ in range(3)]
+        except OSError:
+            head = []
+        if not any(ln.lstrip().startswith(GENERATED_HEADS) for ln in head):
+            out.append(p.relative_to(arch).as_posix())
+    return out
+
+
+def _strip_code(md: str) -> str:
+    md = re.sub(r"(?ms)^[ \t]*(`{3,}|~{3,})[^\n]*\n.*?^[ \t]*\1[`~]*[ \t]*$", "", md)
+    return re.sub(r"(`+)(?!`).*?(?<!`)\1(?!`)", "", md)
+
+
+def validate_staging(files: dict[str, str], chapters: list[Chapter]) -> list[str]:
+    """Problems that block publishing: mandatory chapters, internal links, JSON, the placement invariant."""
+    bad = []
+    names = {c.role: _fname(i, c) for i, c in enumerate(chapters, 1)}
+    bad += [f"missing mandatory chapter {names.get(r, r)}" for r in MANDATORY if names.get(r) not in files]
+    bad += [f"missing {n}" for n in ("INDEX.md", "FILES.md", "UNCERTAINTIES.md", "provenance.json") if n not in files]
+    for name, text in files.items():
+        if name.endswith(".json"):
+            try:
+                json.loads(text)
+            except ValueError:
+                bad.append(f"{name}: invalid JSON")
+            continue
+        # Links into the book must resolve; links leaving it (../, URLs, anchors) are source links
+        for target in LINK_RE.findall(_strip_code(text)):
+            path = posixpath.normpath(unquote(target.split("#")[0])) if target.split("#")[0] else ""
+            if path and "://" not in target and not path.startswith("..") and path not in files:
+                bad.append(f"{name}: broken link {target}")
+    seen: set[str] = set()
+    for c in chapters:
+        bad += [f"{p} is primary in more than one chapter" for p in c.primary if p in seen]
+        seen.update(c.primary)
+    return bad
+
+
+def publish(root: Path, state: Path, run_id: str, files: dict[str, str]) -> None:
+    """Writes files to staging and swaps them in as docs/architecture (§10 steps 4 and 7).
+
+    Contract:
+    - Returns after journal "done", with the old book and old run dirs removed.
+    - Raises ReservedNameCollision (journal "prepared", nothing renamed) when a hand-written file has a reserved
+      name; any other exception leaves a journal for recover().
+    """
+    run_dir = state / "runs" / run_id
+    staging, arch = run_dir / "staging" / "architecture", root / RENDER_DIR
+    for name, text in files.items():
+        (staging / name).parent.mkdir(parents=True, exist_ok=True)
+        (staging / name).write_text(text)
+    # a. journal; b. carry hand-written files over now, so edits made during the run survive
+    _journal(state, run_id, "prepared")
+    for rel in _handwritten(arch):
+        if RESERVED.fullmatch(rel):
+            raise ReservedNameCollision(f"hand-written {RENDER_DIR}/{rel} uses a reserved name; rename it")
+        (staging / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(arch / rel, staging / rel, follow_symlinks=False)
+    # c. old book aside; d. new book in (between the two, recover() can restore the old one)
+    if arch.exists():
+        arch.rename(run_dir / "previous")
+    _journal(state, run_id, "moved-old")
+    arch.parent.mkdir(parents=True, exist_ok=True)
+    staging.rename(arch)
+    _journal(state, run_id, "done")
+    # 7. After done: drop the old book and all but the last KEEP_RUNS run dirs
+    shutil.rmtree(run_dir / "previous", ignore_errors=True)
+    shutil.rmtree(run_dir / "staging", ignore_errors=True)
+    runs = sorted(p for p in (state / "runs").iterdir() if p.is_dir())
+    for old in runs[:-KEEP_RUNS]:
+        shutil.rmtree(old, ignore_errors=True)
+    (state / "publish.json").unlink()
+
+
+# --- cli --------------------------------------------------------------------
+
 @dataclass(frozen=True)
 class Options:
     path: Path
@@ -2020,14 +2192,194 @@ def parse_args(argv: list[str]) -> Options:
     return Options(**vars(p.parse_args(argv)))
 
 
+def _err(msg: str) -> None:
+    print(f"repo-summarize: {msg}", file=sys.stderr)
+
+
+def _estimate(disc: Discovery) -> int:
+    tmp = Path(tempfile.mkdtemp(prefix="repo-summarize-estimate-"))
+    try:
+        batches = catalog_batches(take_snapshot(disc, tmp), disc.included)
+        kb = sum(len(catalog_prompt(b).encode()) for b in batches) / 1000
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    chapters = 3 + subsystem_target(sum(1 for p in disc.included if _is_source(p)))
+    rows = [("catalog", len(batches), f"~{kb:.0f} KB of prompts"), ("plan", 1, ""), ("chapters", chapters, ""),
+            ("index", 1, ""), ("total", len(batches) + chapters + 2, "upper bound before cache hits and re-asks")]
+    for stage, n, note in rows:
+        print(f"{stage:<10}{n:>5}  {note}".rstrip())
+    return EXIT_OK
+
+
+def _dry_run(disc: Discovery) -> int:
+    print(f"discovered {len(disc.discovered)}, included {len(disc.included)}")
+    for reason, paths in sorted(disc.skipped.items()):
+        print(f"skipped ({reason}): {len(paths)}")
+    print("included files:")
+    for p in disc.included:
+        print(f"  {p}")
+    return EXIT_OK
+
+
+def _status(root: Path, state: Path, action: str | None) -> int:
+    runs = sorted(p.name for p in (state / "runs").iterdir() if p.is_dir()) if (state / "runs").is_dir() else []
+    print(f"last run: {runs[-1] if runs else 'none'}")
+    print(f"publish journal: {'pending' if (state / 'publish.json').exists() else 'none'}"
+          + (f" (recovery: {action})" if action else ""))
+    try:
+        prov = json.loads((root / RENDER_DIR / "provenance.json").read_text())
+        print(f"published: run {prov.get('run_id')} at {prov.get('generated_at')}, commit {prov.get('commit')}, "
+              f"calls {prov.get('calls_by_stage')}, cache hits {prov.get('cache_hits_by_stage')}")
+    except (OSError, ValueError, AttributeError):
+        print("published: none")
+    return EXIT_OK
+
+
+def _probe_once(b: Backend, state: Path) -> str:
+    """The probe result for this backend fingerprint; probes only when the fingerprint changed."""
+    rec_path = state / "probe.json"
+    try:
+        rec = json.loads(rec_path.read_text())
+        if rec["fingerprint"] == b.fingerprint:
+            return rec["result"]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    result = probe(b, Path.home())
+    rec_path.write_text(json.dumps({"fingerprint": b.fingerprint, "result": result}))
+    return result
+
+
+def _build(opts: Options, root: Path, state: Path, run_dir: Path, run_id: str) -> int:
+    """Stages 0-8 (§5) for one run; exceptions propagate to run_pipeline for the exit code."""
+    # 1. Discover + snapshot, then the backend check (sandbox policy, probe on a fingerprint change)
+    disc = discover(root)
+    snap = take_snapshot(disc, run_dir)
+    graph = build_graph(snap, disc.included)
+    backend = make_backend(os.environ, opts.unsafe_backend, deny_paths=[root, state])
+    probe_result = _probe_once(backend, state)
+    if probe_result == "probe-access-observed" and backend.sandbox != "none":
+        raise BackendUnsafe("the probe read a file outside the sandbox: the sandbox is not working")
+    runner = Runner(backend, state, opts.max_calls, opts.force, log_path=run_dir / "log.jsonl")
+    # 2. Catalog, plan (persisted unless reused or fallback, so the model gets another chance), attach
+    readme = "\n".join(read_snapshot(snap, "README.md")) if "README.md" in disc.included else ""
+    catalog = run_catalog(snap, disc.included, runner)
+    cached = load_plan(state)
+    chapters, how = run_plan(catalog, graph, readme, runner, cached[0] if cached else None, opts.replan,
+                             cached[1] if cached else None)
+    if how == "model":
+        save_plan(state, chapters, graph.edges, graph.entry_points, top_dirs(disc.included))
+    chapters, exclusions = attach(chapters, graph, catalog, snap, disc.included, runner, readme)
+    # 3. Chapters in order, then the index
+    commands = manifest_commands(snap, disc.included)
+    replies = {c.slug: run_chapter(c, i, chapters, catalog, snap, commands, runner)
+               for i, c in enumerate(chapters, 1)}
+    index_reply = run_index(chapters, replies, graph, readme, runner)
+    # 4. Render, validate, publish (an exception mid-publish is recovered before it propagates)
+    files = render_book(chapters, replies, index_reply, snap, graph, catalog, exclusions, disc,
+                        git_info(root, disc.included), runner.stats, backend, probe_result, run_id,
+                        files_changed=changed_since_snapshot(disc, snap))
+    if bad := validate_staging(files, chapters):
+        _err("staging validation failed: " + "; ".join(bad[:10]))
+        return EXIT_FAIL
+    try:
+        publish(root, state, run_id, files)
+    except BaseException:
+        recover(root, state)
+        raise
+    st = runner.stats
+    print(f"published {RENDER_DIR} (run {run_id}; calls {sum(st['calls_by_stage'].values())}, "
+          f"cache hits {sum(st['cache_hits_by_stage'].values())})")
+    if opts.open:
+        try:
+            subprocess.run(["open" if sys.platform == "darwin" else "xdg-open", str(root / RENDER_DIR / "INDEX.md")],
+                           capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return EXIT_OK
+
+
+def run_pipeline(opts: Options) -> int:
+    """Runs the requested mode under the lock and maps failures to exit codes.
+
+    Contract:
+    - Returns EXIT_OK on publish (or a read-only mode), else the §13 exit code; never raises on run failures.
+    - Always releases the lock and deletes the run's snapshot.
+    Limits: --estimate/--dry-run take the lock (and recover) only when the state dir already exists, so they
+    never create files under the repo.
+    """
+    root = opts.path.resolve()
+    if not root.is_dir():
+        _err(f"not a directory: {opts.path}")
+        return EXIT_USAGE
+    state = root / "docs" / ".repo-summarize"
+    real = not (opts.estimate or opts.dry_run or opts.status or opts.clean)
+    held, run_dir = False, None
+    try:
+        # 1. Lock, then recover an interrupted publish (lock first: recovery must not race a live publish)
+        if real:
+            ensure_state_dir(root)
+        if state.is_dir():
+            acquire_lock(state)
+            held = True
+        action = recover(root, state) if held else None
+        # 2. Modes that stop before any AI call
+        if opts.status:
+            return _status(root, state, action)
+        if opts.clean:
+            shutil.rmtree(state, ignore_errors=True)
+            print(f"removed {state}")
+            return EXIT_OK
+        if opts.estimate:
+            return _estimate(discover(root))
+        if opts.dry_run:
+            return _dry_run(discover(root))
+        # 3. A real run in runs/<run_id>/
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + secrets.token_hex(2)
+        run_dir = state / "runs" / run_id
+        run_dir.mkdir(mode=0o700, parents=True)
+        return _build(opts, root, state, run_dir, run_id)
+    except BackendMissing as e:
+        _err(f"{e} (set REPO_SUMMARIZE_CMD)")
+        return EXIT_FAIL
+    except BackendUnsafe as e:
+        _err(f"backend unsafe: {e}")
+        return EXIT_UNSAFE
+    except Capped as e:
+        _err(f"{e}; nothing published, re-run to resume from the cache")
+        return EXIT_CAPPED
+    except Aborted as e:
+        _err(f"aborted: {e}; nothing published")
+        return EXIT_ABORT
+    except KeyboardInterrupt:
+        _err("interrupted; nothing published")
+        return EXIT_ABORT
+    except Exception as e:  # Locked, ReservedNameCollision and anything unexpected
+        _err(str(e) or type(e).__name__)
+        if os.environ.get("REPO_SUMMARIZE_DEBUG") == "1":
+            traceback.print_exc()
+        return EXIT_FAIL
+    finally:
+        if run_dir:
+            shutil.rmtree(run_dir / "snapshot", ignore_errors=True)
+        if held:
+            release_lock(state)
+
+
 def main(argv: list[str]) -> int:
     try:
-        parse_args(argv)
+        opts = parse_args(argv)
     except SystemExit as e:
         if e.code == 0:
             raise
         return EXIT_USAGE
-    return EXIT_OK
+    timeout = os.environ.get("REPO_SUMMARIZE_TIMEOUT", str(TIMEOUT))
+    if not timeout.strip().isdigit() or int(timeout) <= 0:
+        _err(f"REPO_SUMMARIZE_TIMEOUT must be a positive integer, got {timeout!r}")
+        return EXIT_USAGE
+    if opts.max_calls is not None and opts.max_calls < 0:
+        _err("--max-calls must be 0 or more")
+        return EXIT_USAGE
+    return run_pipeline(opts)
 
 
 if __name__ == "__main__":

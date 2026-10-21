@@ -1,6 +1,7 @@
 """Fake AI backend. Python 3.9-compatible: it may run under /usr/bin/python3."""
 import json
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -34,6 +35,15 @@ def main():
     if "mutate" in scenario:
         m = scenario["mutate"]
         Path(m["path"]).write_text(m["content"])
+    staged = scenario.get("mutate_on_stage", {}).get(stage)
+    if staged:
+        Path(staged["path"]).write_text(staged["content"])
+    if scenario.get("sigint_on_stage") == stage:
+        os.kill(os.getppid(), signal.SIGINT)  # under sandbox-exec (which execs) the parent is the tool
+        time.sleep(2)
+    fail_after = scenario.get("fail_after", {}).get(stage)
+    if fail_after is not None and seen >= fail_after:
+        return 1
     if scenario.get("stderr"):
         sys.stderr.write(scenario["stderr"])
     reply = scenario.get(stage, "")

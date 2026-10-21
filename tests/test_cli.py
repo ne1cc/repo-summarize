@@ -18,8 +18,8 @@ def test_removed_v1_flags_rejected(rs):
     assert rs.main(["--filter", "a"]) == 2
 
 
-def test_valid_invocation_ok(rs):
-    assert rs.main(["--max-calls", "3", "."]) == rs.EXIT_OK
+def test_valid_invocation_ok(rs, tmp_path):
+    assert rs.main(["--dry-run", "--max-calls", "3", str(tmp_path)]) == rs.EXIT_OK
 
 
 def test_shebang_and_pep723():

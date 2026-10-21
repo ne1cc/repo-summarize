@@ -77,3 +77,79 @@ def stub(tmp_path):
 
     yield make
     shutil.rmtree(base, ignore_errors=True)
+
+
+# --- end-to-end fixture -------------------------------------------------------
+
+TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0" * 2
+APP = "".join(["from pkg_a import core\n", "from pkg_b.util import helper\n", "\n", "\n", "def main():\n",
+               "    return helper(core.run())\n", "\n", "\n", "if __name__ == '__main__':\n", "    main()\n"])
+BOOK_FILES = {
+    "README.md": "# Demo\n\nA demo repository.\n",
+    "app.py": APP,
+    "pkg_a/__init__.py": "from .core import run\n",
+    "pkg_a/core.py": "def run():\n    return 1\n",
+    "pkg_b/util.py": "def helper(x):\n    return x + 1\n",
+    "pkg_b/extra.py": "def extra():\n    return 2\n",
+    "tests/test_core.py": "from pkg_a.core import run\n\n\ndef test_run():\n    assert run() == 1\n",
+    "config.yaml": "name: demo\n",
+    "Dockerfile": 'FROM python:3.12\nCMD ["python", "app.py"]\n',
+    "Makefile": "test:\n\tpytest\n",
+    "scripts/run": "#!/bin/sh\necho hi\n",
+    ".env": f"TOKEN={TOKEN}\n",
+}
+BOOK_PLAN = [
+    {"role": "orientation", "slug": "orientation", "title": "Orientation", "why": "Start here.",
+     "primary": ["README.md", "config.yaml", "Dockerfile", "Makefile"]},
+    {"role": "main_flow", "slug": "main-flow", "title": "Main flow", "why": "One path.", "primary": ["app.py"]},
+    {"role": "subsystem", "slug": "core", "title": "Core", "why": "Core logic.", "primary": ["pkg_a/core.py"]},
+    {"role": "subsystem", "slug": "util", "title": "Utilities", "why": "Helpers.",
+     "primary": ["pkg_b/util.py", "pkg_b/extra.py", "scripts/run"]},
+    {"role": "contributing", "slug": "contributing", "title": "Contributing", "why": "Gates.", "primary": []},
+]
+
+
+def chapter_reply(k, ref_path=None):
+    steps = [{"text": "Start in main.", "path": ref_path, "ref": {"start": 1, "end": 5}}] if ref_path else []
+    return json.dumps({"what_this_is": f"Chapter text {k}.", "diagram": "graph TD\n  a --> b", "steps": steps,
+                       "changes": [], "gotchas": []})
+
+
+def book_scenario(files=BOOK_FILES, plan=BOOK_PLAN, n_chapters=5, **extra):
+    """Stub replies: catalog rows for every file, the plan, chapter k (call order; call 2 cites app.py), index."""
+    rows = "\n".join(json.dumps({"path": p, "purpose": f"Purpose of {p}.", "symbols": []}) for p in files)
+    chapters = [chapter_reply(k, "app.py" if k == 1 else None) for k in range(40)]
+    index = json.dumps({"overview": "A demo.", "diagram": "graph TD\n  x --> y",
+                        "why": [f"why {i}" for i in range(n_chapters)]})
+    return {"catalog": rows, "plan": json.dumps(plan), "chapter": chapters, "index": index, **extra}
+
+
+@pytest.fixture
+def tool(rs, stub, make_repo, monkeypatch, tmp_path):
+    """Runs main() against a fixture repo with the stub backend; counts stub calls per stage."""
+    class Tool:
+        def __init__(self):
+            self.env = None
+
+        def repo(self, files=BOOK_FILES, **kw):
+            return make_repo(tmp_path, files, **kw)
+
+        def scenario(self, scenario, **env):
+            self.env = stub(scenario)
+            for k, v in {**self.env, "REPO_SUMMARIZE_PASS_ENV": "STUB_SCENARIO STUB_LOG STUB_VERSION",
+                         **env}.items():
+                monkeypatch.setenv(k, v)
+
+        def calls(self):
+            log = Path(self.env["STUB_LOG"])
+            return [json.loads(ln)["stage"] for ln in log.read_text().splitlines()] if log.exists() else []
+
+        def run(self, repo, *args):
+            before = len(self.calls())
+            code = rs.main([str(repo), *args])
+            return code, [s for s in self.calls()[before:] if s != "probe"]
+
+        def no_sandbox(self):
+            monkeypatch.setattr(rs, "detect_sandbox", lambda: "none")
+
+    return Tool()
