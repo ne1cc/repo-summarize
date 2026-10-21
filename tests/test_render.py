@@ -369,3 +369,11 @@ def test_non_github_remote_is_working_tree(rs, make_repo, tmp_path):
     gi = rs.git_info(repo, ["a.py"])
     assert gi.github is None and gi.has_remote
     assert rs.source_link(gi, "a.py", 1, 1, "docs/architecture") == ("../../a.py#L1-L1", WT)
+
+
+def test_index_title_prefers_github_repo_name(rs, tmp_path):
+    gi = rs.GitInfo("c" * 40, "main", False, ("o", "real-name"), set())
+    ctx = rs._Ctx([], rs.Snapshot(tmp_path, {}, ""), None, gi, "/home", str(tmp_path / "worktree-dir"))
+    assert rs._index_md(ctx, None)[0].startswith("# real-name\n")
+    ctx.gi = rs.GitInfo(None, None, False, None, set())
+    assert rs._index_md(ctx, None)[0].startswith("# worktree-dir\n")

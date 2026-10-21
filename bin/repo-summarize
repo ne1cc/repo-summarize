@@ -1899,7 +1899,7 @@ def _render_chapter(ctx: _Ctx, i: int, ch: Chapter, reply: dict | None) -> tuple
 
 def _index_md(ctx: _Ctx, index_reply: dict | None) -> tuple[str, list[str]]:
     notes: list[str] = []
-    parts = [f"# {_line(Path(ctx.repo).name)}"]
+    parts = [f"# {_line(ctx.gi.github[1] if ctx.gi.github else Path(ctx.repo).name)}"]  # worktree dirs aren't names
     if index_reply is None:
         notes.append("index generation failed")
         parts.append("Overview unavailable — index generation failed.")
