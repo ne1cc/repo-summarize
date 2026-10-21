@@ -592,6 +592,7 @@ build_file_prompt() {
 Rules:
 - Ground every statement in the source or the context above. If something cannot be determined from them (for example the behaviour of a file that is not shown), write "unknown" instead of guessing.
 - Do not invent callers, callees, flags, or behaviour.
+- Draw every diagram (architecture, data flow, sequence, state, dependency tree) as Mermaid in its own ${fence}mermaid block. Never use ASCII or box-drawing art. Quote node labels that contain punctuation, e.g. A["load()"]. Never use a Mermaid keyword (end, off, alt, opt, loop, par, graph) as a node or participant ID.
 - Output ONLY the Markdown sections specified above. No preamble, no closing remarks, and do not wrap the whole document in one code block.
 EOS
 
@@ -673,6 +674,64 @@ $rules
 EOF
 }
 
+# Make Mermaid diagrams render: a fence that is untagged, tagged text, or tagged
+# with a diagram keyword (```flowchart, ```mmd) is retagged ```mermaid when its
+# first statement is a Mermaid header; a bare Mermaid diagram outside any fence
+# is wrapped in one, ending at the next blank line or heading. Code fences in a
+# real language are never touched, and stdin → stdout is otherwise verbatim.
+wrap_mermaid() {
+  awk '
+    function header(s) {
+      sub(/^[ \t]+/, "", s); sub(/[ \t;]+$/, "", s)
+      return s ~ /^(graph|flowchart)[ \t]+(TD|TB|BT|RL|LR)$/ ||
+             s ~ /^(sequenceDiagram|classDiagram(-v2)?|stateDiagram(-v2)?|erDiagram|journey|gantt|pie|mindmap|timeline|gitGraph|quadrantChart|requirementDiagram|kanban|C4(Context|Container|Component|Dynamic|Deployment)|(sankey|xychart|block|packet|architecture)-beta)([ \t].*)?$/
+    }
+    function indent(s) { match(s, /^[ \t]*/); return RLENGTH }
+    function flush(tag,   i) {
+      print (tag ? pad mark "mermaid" : buf[0])
+      for (i = 1; i < nbuf; i++) print buf[i]
+      nbuf = 0; pending = 0
+    }
+    {
+      line = $0; t = line; sub(/^[ \t]+/, "", t)
+      if (pending) {
+        buf[nbuf++] = line
+        if (t == "" || t ~ /^%%/) next
+        if (t ~ "^" mark) { flush(0); fence = ""; next }
+        flush(header(line)); next
+      }
+      if (fence != "") {
+        print line
+        if (t ~ "^" fence substr(fence, 1, 1) "*[ \t]*$") fence = ""
+        next
+      }
+      if (unfenced) {
+        if (t == "" || t ~ /^#/ || t ~ /^(```|~~~)/) { print pad "```"; unfenced = 0 }
+        else { print line; next }
+      }
+      if (indent(line) < 4 && match(t, /^(```+|~~~+)/)) {
+        mark = substr(t, 1, RLENGTH); fence = mark
+        info = substr(t, RLENGTH + 1); sub(/^[ \t]+/, "", info); sub(/[ \t]+$/, "", info)
+        pad = substr(line, 1, indent(line))
+        if (header(info)) { print pad mark "mermaid"; print pad info; next }
+        if (info ~ /^(text|txt|plaintext|ascii|mmd)?$/) {
+          nbuf = 0; buf[nbuf++] = line; pending = 1; next
+        }
+        print line; next
+      }
+      if (indent(line) < 4 && header(line)) {
+        pad = substr(line, 1, indent(line))
+        print pad "```mermaid"; print line; unfenced = 1; next
+      }
+      print line
+    }
+    END {
+      if (pending) flush(0)
+      if (unfenced) print pad "```"
+    }
+  '
+}
+
 for rel in "${FILES_TO_PROCESS[@]+"${FILES_TO_PROCESS[@]}"}"; do
   CURRENT_INDEX=$(( CURRENT_INDEX + 1 ))
   doc_rel="docs/architecture/${rel}.md"
@@ -712,7 +771,7 @@ for rel in "${FILES_TO_PROCESS[@]+"${FILES_TO_PROCESS[@]}"}"; do
   fi
 
   if RESPONSE="$("${AI_CMD[@]}" "$(cat "$tmp_prompt")" 2>>"$ERR_LOG")" && [[ "$RESPONSE" =~ [^[:space:]] ]]; then
-    :
+    RESPONSE="$(printf '%s\n' "$RESPONSE" | wrap_mermaid)"
   else
     fail_file "$rel" "${AI_CMD[0]} exited non-zero or returned empty output"
     continue
@@ -789,6 +848,8 @@ Your task: write a comprehensive INDEX.md that:
 Per-file summaries:
 $ALL_SUMMARIES
 
+Draw every diagram as Mermaid in its own \`\`\`mermaid block, never ASCII or box-drawing art, and quote node labels that contain punctuation. Never use a Mermaid keyword (end, off, alt, opt, loop, par, graph) as a node or participant ID.
+
 Write in clean GitHub-Flavored Markdown. Make this the definitive architectural reference for a new engineer joining the project.
 EOF
 
@@ -797,6 +858,7 @@ if ! INDEX_RESPONSE="$("${AI_CMD[@]}" "$(cat "$tmp_index_prompt")" 2>>"$ERR_LOG"
   echo "✗ INDEX synthesis failed — existing INDEX.md left untouched. See ${ERR_LOG#"$TARGET_DIR"/}" >&2
   exit 1
 fi
+INDEX_RESPONSE="$(printf '%s\n' "$INDEX_RESPONSE" | wrap_mermaid)"
 
 cat <<EOF > "$INDEX_FILE"
 # $REPO_NAME — Architectural Overview

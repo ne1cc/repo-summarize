@@ -34,6 +34,44 @@ grep -q 'stub summary' docs/architecture/a.py.md || fail "summary lacks backend 
 grep -q 'stub summary' docs/architecture/INDEX.md || fail "INDEX.md lacks backend output"
 grep -q '"status": *"complete"' docs/architecture/.progress.json || fail "progress not marked complete"
 
+# Diagrams: the prompt asks for Mermaid, and Mermaid the model left untagged or
+# unfenced is fenced as ```mermaid; real code fences and ASCII text are untouched.
+cat > "$TMP/diagram-ai" <<EOF
+#!/usr/bin/env bash
+printf '%s' "\${@: -1}" > "$TMP/last-prompt"
+cat <<'OUT'
+## Summary
+\`\`\`
+flowchart LR
+  A --> B
+\`\`\`
+
+\`\`\`sequenceDiagram
+  A->>B: hi
+\`\`\`
+
+graph TD
+  C --> D
+
+\`\`\`python
+graph TD
+\`\`\`
+
+\`\`\`
+a.py -> b.py
+\`\`\`
+OUT
+EOF
+chmod +x "$TMP/diagram-ai"
+REPO_SUMMARIZE_CMD="$TMP/diagram-ai" "$BIN" --force >/dev/null
+grep -q '```mermaid' "$TMP/last-prompt" || fail "prompt does not ask for Mermaid diagrams"
+DOC=docs/architecture/a.py.md
+[[ "$(grep -c '^```mermaid$' "$DOC")" == 3 ]] || fail "expected 3 mermaid fences in $DOC"
+grep -A1 '^```mermaid$' "$DOC" | grep -q '^graph TD$' || fail "unfenced diagram not wrapped"
+grep -q '^```python$' "$DOC" || fail "python fence was retagged"
+grep -B1 '^a.py -> b.py$' "$DOC" | grep -q '^```$' || fail "plain fence was retagged"
+[[ "$(grep -c '^```mermaid$' docs/architecture/INDEX.md)" == 3 ]] || fail "INDEX.md diagrams not fenced"
+
 # Missing backend must fail loudly
 if REPO_SUMMARIZE_CMD="definitely-not-installed -p" "$BIN" --force >/dev/null 2>&1; then
   fail "missing backend should exit non-zero"
