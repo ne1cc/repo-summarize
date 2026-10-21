@@ -4,3 +4,5 @@
 !.env.example
 __pycache__/
 .pytest_cache/
+.worktrees/
+.superpowers/

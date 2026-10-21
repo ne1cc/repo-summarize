@@ -1,120 +1,127 @@
 # repo-summarize
 
-Turn any codebase into an **annotated architecture walkthrough** with one command.
+Turn a codebase into a short, ordered book of Markdown files that a developer reads to learn how to work in it.
 
-`repo-summarize` is a single-file Bash tool. It maps your repository without any AI, then asks an AI CLI of your choice to explain every source file *in the context of its callers and callees*, and finally synthesises an architectural `INDEX.md`. Output is plain Markdown in `docs/architecture/`, so it diffs, greps, and renders anywhere.
+`repo-summarize` is a single-file, stdlib-only Python 3.12+ tool run by `uv`. It scans the repository without AI, then asks an AI CLI to catalog the files, plan chapters and write each chapter as structured JSON. The tool itself renders the Markdown, pastes the code excerpts from a snapshot of your files, and publishes `docs/architecture/`.
+
+## The book
 
 ```text
-$ repo-summarize        # example output
-Repo map: docs/architecture/.repo-map.md (212 files, 640 import edges)
-🧠 [1/212] Summarizing: src/server.ts (88 lines, line mode) → docs/architecture/src/server.ts.md ...
-...
-✓ All summaries generated!
+docs/architecture/
+├── INDEX.md            overview, system diagram, chapter table
+├── 01-orientation.md   what it is, stack, layout, install/run/test/build
+├── 02-main-flow.md     one path from an entry point to an output
+├── 03-<slug>.md …      0-9 subsystem chapters
+├── NN-contributing.md  CI gates, conventions, PR flow
+├── FILES.md            every included file, skipped files and reasons
+├── UNCERTAINTIES.md    what the labels did not check
+└── provenance.json     run, backend and sandbox record
 ```
 
-## Why it's different
-
-- **Scan first, explain second.** Pass 0 costs zero tokens: it builds a repo map (layout, entry points, heuristic import graph). Every per-file prompt then carries that file's callers, callees and siblings, so explanations say *why a file exists*, not just what it does.
-- **Annotated walkthroughs, not blurbs.** Files of 150 lines or fewer get a comment above every source line; longer files get per-block explanations. The prompt forbids modifying the source and requires "unknown" over invention.
-- **Backend-agnostic.** Any CLI that takes a prompt as its last argument and prints a reply works (`REPO_SUMMARIZE_CMD`). Default: `agy -p`.
-- **Resumable and honest.** Failed files are logged and skipped, never saved as junk. Finished files are cached and re-run only when the source is newer. If INDEX synthesis fails, your existing `INDEX.md` is left untouched and the exit code is non-zero.
-- **Zero dependencies beyond Bash.** Tested on macOS with its stock bash 3.2; Linux code paths exist (`fd`/`git`/`find`, `xdg-open`) but are less exercised.
-
-## How it works
+Chapters use fixed headings (What this is, How it fits together, How it works, Where to change things, Gotchas) and end with a footer of primary files, related files, tests and related chapters. Maximum 12 chapters. Hand-written files in `docs/architecture/` are kept, except names the tool reserves (`INDEX.md`, `FILES.md`, `UNCERTAINTIES.md`, `provenance.json`, `NN-*.md`, `reference/`): an unmarked file with a reserved name stops the run without publishing.
 
 ```mermaid
 flowchart LR
-  A[Repo files] --> B["Pass 0: scan<br/>no AI"]
-  B --> C[".repo-map.md<br/>layout · entry points · import graph"]
-  C --> D["Pass 1: per file<br/>source + callers + callees"]
-  D --> E["docs/architecture/&lt;file&gt;.md"]
-  E --> F["Pass 2: synthesise"]
-  C --> F
-  F --> G["INDEX.md<br/>overview · module map · data flows"]
+  A[Discover + snapshot] --> B[Backend check]
+  B --> C[Catalog]
+  C --> D[Plan]
+  D --> E[Attach + budget]
+  E --> F[Chapters]
+  F --> G[Index]
+  G --> H[Render]
+  H --> I[Validate + publish]
 ```
 
-## Requirements
-
-- Bash 3.2+ (macOS default is fine), `git` recommended.
-- An AI CLI with a non-interactive print mode, such as `agy` (default) or `claude`.
-- Optional: `fd` (faster discovery), `jq` (prettier `--status`).
+Only stages 2, 3, 5 and 6 (catalog, plan, chapters, index) call the backend, plus one probe call when the backend fingerprint changes.
 
 ## Install
 
 ```bash
 git clone https://github.com/ne1cc/repo-summarize.git
-ln -s "$PWD/repo-summarize/bin/repo-summarize" ~/.local/bin/repo-summarize   # or any dir on PATH
+ln -s "$PWD/repo-summarize/bin/repo-summarize" ~/.local/bin/repo-summarize
 ```
+
+Requires [`uv`](https://docs.astral.sh/uv/) (the script header declares Python >= 3.12 and no dependencies), `git` recommended, and an AI CLI with a print mode.
 
 ## Usage
 
-```bash
-repo-summarize                    # summarize the current git repository
-repo-summarize /path/to/repo      # target another repository
-repo-summarize --dry-run          # scan only: write the repo map, make no AI calls
-repo-summarize --max-files 20     # cap the run (sampled across top-level directories)
-repo-summarize --filter src/api   # only summarize paths containing a substring
-repo-summarize --force            # regenerate existing summaries
-repo-summarize --status           # progress of a running or finished run
-repo-summarize --open             # open INDEX.md when done (omd, One Markdown, glow, or xdg-open)
-```
-
-### Choose your AI backend
-
-The prompt is appended as the last argument:
-
-```bash
-REPO_SUMMARIZE_CMD="claude -p" repo-summarize
-REPO_SUMMARIZE_CMD="agy -p --model <model>" repo-summarize
-```
-
-Use a read-only, non-interactive mode. This tool never needs the model to run tools or edit files, so **do not** pass flags such as `--dangerously-skip-permissions`.
-
-## Output
-
 ```text
-docs/architecture/
-├── INDEX.md              # AI-synthesised architectural overview (Mermaid module map, data flows)
-├── .repo-map.md          # zero-AI repo map: layout, entry points, import graph, line counts
-├── .repo-edges.tsv       # importer<TAB>imported pairs
-├── .progress.json        # live status read by --status
-└── <path/to/file>.md     # one annotated walkthrough per source file
+repo-summarize [path]     build and publish the book
+  --estimate              calls per stage and prompt size; no AI calls, no writes
+  --dry-run               discovery and coverage only; no writes
+  --status                last run, publish journal, published run; recovers an interrupted publish
+  --max-calls N           stop before call N+1; exit 4; nothing published
+  --force                 ignore the generation cache
+  --replan                ignore plan reuse
+  --open                  open INDEX.md after publishing
+  --clean                 delete docs/.repo-summarize/
+  --unsafe-backend        allow a non-sandboxed backend or yolo flags
 ```
 
-A short file's walkthrough (excerpt from a real run):
+| Env | Default | Meaning |
+|---|---|---|
+| `REPO_SUMMARIZE_CMD` | `agy --disable-slash-commands -p` | Backend command, split like a shell; the prompt is appended as the last argument |
+| `REPO_SUMMARIZE_TIMEOUT` | `300` | Seconds per backend call |
+| `REPO_SUMMARIZE_PASS_ENV` | none | Extra environment variable names to pass to the backend (it otherwise gets only PATH, HOME, LANG, TMPDIR) |
+| `REPO_SUMMARIZE_CACHE_NAMESPACE` | none | Mixed into the cache key |
 
-````markdown
-```py
-# » Imports peer module `b` so that this module can reference its namespace and access attributes like `b.x`.
-import b
+Exit codes: 0 published, 1 failed, 2 usage, 3 aborted (3 consecutive call failures), 4 capped by `--max-calls`, 5 backend unsafe.
 
-# » Defines the `main()` function encapsulating the primary execution logic of displaying `b`'s state.
-def main():
-    # » Reads `x` from module `b` and prints it to standard output.
-    print(b.x)
-```
-````
+Private state lives in `docs/.repo-summarize/` (mode 0700, contains a `.gitignore` of `*`, so it is never committed). Snapshots are deleted at the end of each run, cached replies are 0600, and logs hold sizes, hashes and labels, never prompt or reply bodies. The last 3 run logs are kept.
 
-Languages scanned: py, ts/tsx, js/jsx, go, rs, lua, sh/zsh, sql, c/c++/h/hpp, java, kt, swift, cmake. Import edges are heuristic (py, js/ts, lua, sh/zsh, c/c++); ambiguous or external imports are omitted rather than guessed. Lockfiles, minified assets, images and common build directories (`node_modules`, `dist`, `build`, `target`, `vendor`, ...) are skipped.
+## Safety model
 
-## Privacy and security
+The default backend is `agy --disable-slash-commands -p`; agy takes the next argument as its prompt and has no stdin input. Behaviour observed with agy 1.4.3 on macOS (2026-10-21):
 
-- **Your source code is sent to whatever AI provider your backend CLI uses.** Do not run this on code you are not allowed to share with that provider.
-- Repository contents become part of the prompt. A malicious file could contain prompt-injection text, which is why the default backend runs without skipping permissions. Review the generated docs before publishing them.
+| Layer | Status |
+|---|---|
+| Writes and shell commands | agy auto-denies them in print mode, unless your agy settings contain allow-rules |
+| File reads | not restricted by agy: it can read files anywhere on disk, and agy's own flags do not prevent this |
+| OS sandbox | the tool runs every backend call under it (below) |
 
-## Known limitations
+- **macOS:** every call runs under `sandbox-exec`. Reads under `$HOME` are denied except agy's config dirs; writes are allowed only in temp dirs and agy's dirs; the repo root and state dir are explicitly denied. The backend sees only its prompt.
+- **Linux:** uses `bwrap` if installed. This is implemented but has not been tested on Linux.
+- **No sandbox available**, or a yolo flag such as `--dangerously-skip-permissions`: the run exits 5 unless you pass `--unsafe-backend`.
+- On a backend fingerprint change the tool makes one probe call asking the backend to read a sentinel file under `$HOME`. This is a regression check, not authorization. If access is observed under an active sandbox, the run stops with exit 5.
+- The sandbox does not restrict network access or starting other programs.
+- If your agy settings contain allow-rules (for example `command(...)`), they widen what agy may do. The tool lists them in `provenance.json`.
 
-- Some models write absolute `file://` links into the generated docs. Those embed local paths; strip or rewrite them before committing the output.
-- Prompts are passed as one argument and capped at 110 KB. A file that exceeds this even without dependency excerpts is skipped and reported.
-- Per-file calls run sequentially. Large repositories take a while; use `--max-files` or `--filter`, and re-run to resume.
+Files such as `.env*`, `*.pem`, `*.key`, `secrets/**` are never read. Common token and key patterns are replaced with `[REDACTED]` on the same line, so line numbers do not change.
+
+## Limits
+
+- Labels check structure, not truth. A reference label means the cited lines exist, an identifier occurs near the cited line, or an import path connects two files. It does not mean the explanation is correct.
+- A real but wrong recommendation (a function that exists but is the wrong one to change) cannot be detected.
+- Redaction is best-effort and can miss secrets.
+- Repository content is sent to the configured backend. Do not run this on code you may not share with it.
+- agy keeps its own conversation history (under `~/.gemini`); the tool cannot control that.
+- The import graph is heuristic and covers Python, JS/TS, Lua, shell and C/C++ only. Other languages are still cataloged, but contribute no edges.
+- Calls run one at a time, so large repositories take a while. Re-runs reuse cached replies.
+- Publishing is recoverable, not atomic: an interrupted publish is restored by the next run (or `--status`).
+- No complete-book acceptance run against real agy had been done when this was written.
+
+## v2.1 roadmap
+
+- Per-file `--reference` walkthroughs (planned default: top 20 files by fan-in; `--reference all` for everything)
+- Go, Rust and Java/Kotlin import extractors
+- Snapping excerpts to the enclosing `def`
+- Automatic chapter splitting
+- Cache pruning
+- A richer `--status`
+
+## Migrating from v1
+
+- Per-file docs are no longer generated. On the first v2 publish, v1/v2-marked files in `docs/architecture/` are removed; hand-written files are kept.
+- `--filter` and `--max-files` are removed.
+- The Bash script is gone. Install through `uv` as above; `bash tests/smoke.sh` is replaced by pytest.
 
 ## Development
 
 ```bash
-bash tests/smoke.sh     # offline: all three passes against a stub AI backend
+uv run --with pytest pytest -q   # offline, uses a stub backend
 ```
 
-History: v1 (headless per-file summaries and an index) → full coverage with an AI-synthesised index → progress tracking and `--status` → scan-first annotated walkthroughs with the import graph and reliability fixes. See [CHANGELOG.md](CHANGELOG.md).
+See [CHANGELOG.md](CHANGELOG.md). Design: `docs/superpowers/specs/2026-10-20-book-mode-design.md`.
 
 ## License
 
