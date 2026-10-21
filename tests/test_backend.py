@@ -2,7 +2,9 @@ import dataclasses
 import json
 import os
 import shlex
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -13,11 +15,11 @@ STUB_PASS = "STUB_SCENARIO,STUB_LOG STUB_VERSION"
 @pytest.fixture
 def backend(rs, stub, monkeypatch):
     """Build a Backend over the stub; returns (backend, log_path)."""
-    def make(scenario, unsafe=False, **extra):
+    def make(scenario, unsafe=False, deny_paths=(), **extra):
         env = {**stub(scenario), "REPO_SUMMARIZE_PASS_ENV": STUB_PASS, **extra}
         for k, v in env.items():
             monkeypatch.setenv(k, v)
-        return rs.make_backend(os.environ, unsafe), Path(env["STUB_LOG"])
+        return rs.make_backend(os.environ, unsafe, deny_paths), Path(env["STUB_LOG"])
     return make
 
 
@@ -108,7 +110,8 @@ def test_fingerprint_changes(rs, backend, monkeypatch):
     monkeypatch.delenv("REPO_SUMMARIZE_CACHE_NAMESPACE")
     monkeypatch.setenv("STUB_VERSION", "stub-1")
     assert backend({})[0].fingerprint == base
-    monkeypatch.setattr(rs, "sandbox_profile", lambda home: "(version 1)(allow default)")
+    assert backend({}, deny_paths=["/nonexistent/repo"])[0].fingerprint != base
+    monkeypatch.setattr(rs, "sandbox_profile", lambda home, deny_paths=(): "(version 1)(allow default)")
     if rs.detect_sandbox() == "sandbox-exec":
         assert backend({})[0].fingerprint != base
 
@@ -118,6 +121,8 @@ def test_sandbox_profile_escapes_home(rs):
     assert '(deny file-read* (subpath "/nonexistent/we\\"ird\\\\home"))' in prof
     assert '(literal "/nonexistent/we\\"ird\\\\home")' in prof
     assert '(subpath "/nonexistent/we\\"ird\\\\home/.gemini")' in prof
+    prof = rs.sandbox_profile(Path("/nonexistent/h"), ["/nonexistent/repo"])
+    assert prof.rstrip().endswith('(deny file-read* file-write* (subpath "/nonexistent/repo"))')
 
 
 def test_bwrap_prefix(rs, tmp_path):
@@ -129,6 +134,7 @@ def test_bwrap_prefix(rs, tmp_path):
         "--bind", str(home / ".gemini"), str(home / ".gemini"),
         "--ro-bind", str(home / ".local"), str(home / ".local"),
         "--dev", "/dev", "--proc", "/proc", "--chdir", "/tmp/cwd", "--"]
+    assert rs.sandbox_argv("bwrap", home, "/tmp/cwd", ["/srv/repo"])[6:8] == ["--tmpfs", "/srv/repo"]
     assert rs.sandbox_argv("none", home, "/tmp/cwd") == []
 
 
@@ -146,12 +152,56 @@ def test_sandbox_blocks_home_read(rs, backend, tmp_path, monkeypatch):
     assert "TOKEN-5f2a" in rs.call(dataclasses.replace(b, sandbox="none"), "STAGE: chapter")
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="sandbox-exec is macOS-only")
+def test_sandbox_write_allowlist(rs, backend, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / "Library" / "LaunchAgents").mkdir(parents=True)
+    (home / ".gemini" / "antigravity-cli").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    name = f"repo-summarize-test-{os.getpid()}.txt"
+    blocked = [Path("/Users/Shared") / name, home / "Library" / "LaunchAgents" / name,
+               home / ".gemini" / "antigravity-cli" / "settings.json"]
+    allowed = [home / ".gemini" / name, home / "Library" / "Caches" / name, Path("/tmp") / name]
+    (home / "Library" / "Caches").mkdir()
+    b, _ = backend({"chapter": "ok", "write_paths": [str(p) for p in blocked + allowed]})
+    try:
+        reply = rs.call(b, "STAGE: chapter")
+        for p in blocked:
+            assert f"write-failed {p}" in reply and not p.exists()
+        for p in allowed:
+            assert f"wrote {p}" in reply
+        # Control: without the sandbox the same writes succeed (where the OS permits).
+        reply = rs.call(dataclasses.replace(b, sandbox="none"), "STAGE: chapter")
+        assert f"wrote {blocked[1]}" in reply
+    finally:
+        for p in blocked + allowed:
+            p.unlink(missing_ok=True)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="sandbox-exec is macOS-only")
+def test_sandbox_deny_paths(rs, backend, tmp_path):
+    repo = Path(tempfile.mkdtemp(dir="/tmp"))
+    try:
+        (repo / "secret.txt").write_text("TOKEN-repo")
+        b, _ = backend({"read_path": str(repo / "secret.txt")}, deny_paths=[str(repo)])
+        assert b.deny_paths == [os.path.realpath(repo)]
+        assert "TOKEN-repo" not in rs.call(b, "STAGE: chapter")
+        assert "TOKEN-repo" in rs.call(dataclasses.replace(b, deny_paths=[]), "STAGE: chapter")
+    finally:
+        shutil.rmtree(repo)
+
+
 def test_probe_access_observed(rs, backend, tmp_path):
     b, log = backend({"probe": "here: tok-123"})
     assert rs.probe(b, tmp_path, token="tok-123") == "probe-access-observed"
     assert _calls(log)[-1]["stage"] == "probe"
     assert not list(tmp_path.glob(".repo-summarize-probe-*"))
     b, _ = backend({"probe": "done", "mutate": {"path": "canary", "content": "x"}})
+    assert rs.probe(b, tmp_path, token="tok-123") == "probe-access-observed"
+    # agy prints the token, then auto-denies the canary write and exits non-zero.
+    b, _ = backend({"probe": "tok-123", "stderr": "write_file auto-denied", "exit_code": 1})
+    assert rs.probe(b, tmp_path, token="tok-123") == "probe-access-observed"
+    b, _ = backend({"probe": "x", "stderr": "leaked tok-123"})
     assert rs.probe(b, tmp_path, token="tok-123") == "probe-access-observed"
 
 
@@ -162,6 +212,8 @@ def test_probe_no_access_observed(rs, backend, tmp_path):
     assert not list(tmp_path.glob(".repo-summarize-probe-*"))
     b, _ = backend({"probe": "x", "stderr": "write_file auto-denied"})
     assert rs.probe(b, tmp_path) == "probe-no-access-observed"
+    b, _ = backend({"probe": "tok-1", "sleep": 3}, REPO_SUMMARIZE_TIMEOUT="1")
+    assert rs.probe(b, tmp_path, token="tok-1") == "probe-no-access-observed"
 
 
 def test_allow_rules_reported(rs, backend, tmp_path, monkeypatch):

@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -451,6 +451,7 @@ class Backend:
     sandbox: str
     fingerprint: str
     allow_rules: list[str]
+    deny_paths: list[str]
 
 
 def detect_sandbox() -> str:
@@ -461,24 +462,37 @@ def detect_sandbox() -> str:
     return "none"
 
 
-def sandbox_profile(home: Path) -> str:
-    h = str(home.resolve()).replace("\\", "\\\\").replace('"', '\\"')
-    return (
-        "(version 1)(allow default)\n"
-        f'(deny file-read* (subpath "{h}"))\n'
+def _sbpl(s: str) -> str:
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def sandbox_profile(home: Path, deny_paths: Sequence[str] = ()) -> str:
+    """Reads: deny $HOME except agy's dirs. Writes: allowlist only. SBPL: the last matching rule wins."""
+    hr = str(home.resolve())
+    h = _sbpl(hr)[1:-1]
+    tmp = os.path.realpath(os.environ.get("TMPDIR", "/private/tmp"))
+    return "\n".join([
+        "(version 1)(allow default)",
+        f'(deny file-read* (subpath "{h}"))',
         f'(allow file-read* (subpath "{h}/.gemini") (subpath "{h}/.antigravity") (subpath "{h}/.local")'
-        f' (subpath "{h}/Library") (literal "{h}"))\n'
-        f'(deny file-write* (subpath "{h}"))\n'
-        f'(allow file-write* (subpath "{h}/.gemini") (subpath "{h}/.antigravity") (subpath "{h}/Library"))\n'
-    )
+        f' (subpath "{h}/Library") (literal "{h}"))',
+        "(deny file-write*)",
+        f'(allow file-write* (subpath "/dev") (subpath {_sbpl(tmp)}) (subpath "/private/tmp")'
+        f' (subpath "/private/var/folders") (subpath "{h}/.gemini") (subpath "{h}/.antigravity")'
+        f' (subpath "{h}/Library/Caches") (subpath "{h}/Library/Application Support"))',
+        f'(deny file-write* (subpath "{h}/Library/LaunchAgents")'
+        f' (regex {_sbpl("^" + re.escape(hr + "/.gemini/") + ".*settings\\.json$")}))',
+        *(f"(deny file-read* file-write* (subpath {_sbpl(d)}))" for d in deny_paths),
+    ]) + "\n"
 
 
-def sandbox_argv(kind: str, home: Path, cwd: str) -> list[str]:
+def sandbox_argv(kind: str, home: Path, cwd: str, deny_paths: Sequence[str] = ()) -> list[str]:
     if kind == "sandbox-exec":
-        return ["/usr/bin/sandbox-exec", "-p", sandbox_profile(home)]
+        return ["/usr/bin/sandbox-exec", "-p", sandbox_profile(home, deny_paths)]
     if kind == "bwrap":
         binds = [x for d, flag in AGY_DIRS.items() if (home / d).exists() for x in (flag, str(home / d), str(home / d))]
-        return ["bwrap", "--ro-bind", "/", "/", "--tmpfs", str(home), *binds,
+        hide = [x for d in deny_paths for x in ("--tmpfs", d)]
+        return ["bwrap", "--ro-bind", "/", "/", "--tmpfs", str(home), *hide, *binds,
                 "--dev", "/dev", "--proc", "/proc", "--chdir", cwd, "--"]
     return []
 
@@ -513,7 +527,7 @@ def _allow_rules(home: Path) -> list[str]:
     return [r for r in allow if isinstance(r, str)] if isinstance(allow, list) else []
 
 
-def make_backend(env: Mapping[str, str], unsafe: bool) -> Backend:
+def make_backend(env: Mapping[str, str], unsafe: bool, deny_paths: Sequence[str | Path] = ()) -> Backend:
     argv = shlex.split(env.get("REPO_SUMMARIZE_CMD", DEFAULT_CMD))
     yolo = any(a == "--dangerously-skip-permissions" or "yolo" in a.lower() for a in argv)
     sandbox = detect_sandbox()
@@ -525,25 +539,30 @@ def make_backend(env: Mapping[str, str], unsafe: bool) -> Backend:
     timeout = int(env.get("REPO_SUMMARIZE_TIMEOUT", TIMEOUT))
     pass_env = env.get("REPO_SUMMARIZE_PASS_ENV", "").replace(",", " ").split()
     home = Path.home()
+    deny = [os.path.realpath(d) for d in deny_paths]
     fp = hashlib.sha256(json.dumps([
         argv, _version_text(argv, exe, pass_env), ADAPTER_VERSION,
-        sandbox_argv(sandbox, home, "<cwd>"), env.get("REPO_SUMMARIZE_CACHE_NAMESPACE", ""),
+        sandbox_argv(sandbox, home, "<cwd>", deny), env.get("REPO_SUMMARIZE_CACHE_NAMESPACE", ""), deny,
     ]).encode()).hexdigest()
-    return Backend(argv, timeout, pass_env, sandbox, fp, _allow_rules(home))
+    return Backend(argv, timeout, pass_env, sandbox, fp, _allow_rules(home), deny)
 
 
-def call(b: Backend, prompt: str, cwd: str | None = None) -> str:
-    """Run the backend on one prompt in a sandbox. Errors carry reasons only, never prompt/reply text."""
-    run_dir = cwd or tempfile.mkdtemp(prefix="repo-summarize-call-")
+def _run(b: Backend, prompt: str, cwd: str) -> subprocess.CompletedProcess:
+    """Run the backend once, sandboxed, in cwd. Raises subprocess.TimeoutExpired."""
+    return subprocess.run([*sandbox_argv(b.sandbox, Path.home(), cwd, b.deny_paths), *b.argv, prompt], cwd=cwd,
+                          env=_child_env(b.pass_env), capture_output=True, text=True, errors="replace",
+                          timeout=b.timeout)
+
+
+def call(b: Backend, prompt: str) -> str:
+    """Run the backend on one prompt in a fresh temp dir. Errors carry reasons only, never prompt/reply text."""
+    run_dir = tempfile.mkdtemp(prefix="repo-summarize-call-")
     try:
-        r = subprocess.run([*sandbox_argv(b.sandbox, Path.home(), run_dir), *b.argv, prompt], cwd=run_dir,
-                           env=_child_env(b.pass_env), capture_output=True, text=True, errors="replace",
-                           timeout=b.timeout)
+        r = _run(b, prompt, run_dir)
     except subprocess.TimeoutExpired:
         raise CallFailed("timeout") from None
     finally:
-        if cwd is None:
-            shutil.rmtree(run_dir, ignore_errors=True)
+        shutil.rmtree(run_dir, ignore_errors=True)
     if "auto-denied" in r.stdout or "auto-denied" in r.stderr:
         raise CallFailed("tool-denied")
     if re.search(r"not logged in|authenticate", r.stderr, re.I):
@@ -567,10 +586,12 @@ def probe(b: Backend, home: Path, token: str | None = None) -> str:
         prompt = (f"STAGE: probe\nRead the file {sentinel} and print its contents exactly. "
                   "Then create a file named canary in your current directory.")
         try:
-            reply = call(b, prompt, cwd=run_dir)
-        except CallFailed:
-            reply = ""
-        seen = token in reply or (Path(run_dir) / "canary").exists()
+            r = _run(b, prompt, run_dir)
+            # Exit code and denials don't matter: agy may print the token and then fail on the canary write.
+            leaked = token in r.stdout or token in r.stderr
+        except subprocess.TimeoutExpired:
+            leaked = False
+        seen = leaked or (Path(run_dir) / "canary").exists()
         return "probe-access-observed" if seen else "probe-no-access-observed"
     finally:
         shutil.rmtree(sdir, ignore_errors=True)

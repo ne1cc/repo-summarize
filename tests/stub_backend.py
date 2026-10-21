@@ -36,8 +36,6 @@ def main():
         Path(m["path"]).write_text(m["content"])
     if scenario.get("stderr"):
         sys.stderr.write(scenario["stderr"])
-    if scenario.get("exit_code"):
-        return scenario["exit_code"]
     reply = scenario.get(stage, "")
     if isinstance(reply, list):
         reply = reply[min(seen, len(reply) - 1)] if reply else ""
@@ -46,8 +44,14 @@ def main():
             reply = Path(scenario["read_path"]).read_text()
         except OSError as e:
             reply = "read-failed: " + type(e).__name__
+    for p in scenario.get("write_paths", []):
+        try:
+            Path(p).write_text("x")
+            reply += "\nwrote " + p
+        except OSError:
+            reply += "\nwrite-failed " + p
     sys.stdout.write(reply)
-    return 0
+    return scenario.get("exit_code", 0)
 
 
 sys.exit(main())
