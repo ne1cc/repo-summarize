@@ -28,8 +28,8 @@ docs/architecture/
   FILES.md            every file: purpose, key symbols, chapter, tests, imported-by
   reference/<path>.md only with --reference (per-file annotated walkthroughs, today's output)
   UNCERTAINTIES.md    what could not be verified: dropped refs, flagged citations, uncovered files,
-                      DeepWiki claims not supported locally (§5.6)
-  provenance.json     commit, dirty flag, generated_at, backend, prompt versions, DeepWiki use (§5.6)
+                      DeepWiki claims not supported locally (§5.7)
+  provenance.json     commit, dirty flag, generated_at, backend, prompt versions, DeepWiki use (§5.7)
   .repo-map.md  .repo-edges.tsv  .cache/  .progress.json  .repo-summarize.log
 ```
 
