@@ -33,6 +33,7 @@ def test_batches_respect_60kb(rs, tmp_path):
     for b in batches:
         assert sum(len(t.encode()) for _, t, _ in b) <= rs.BATCH_BYTES
         assert all(t.count("\n") + 1 <= rs.FILE_LINES for _, t, _ in b)
+        assert len(rs.catalog_prompt(b).encode()) < rs.PROMPT_LIMIT
 
 
 def test_single_huge_file_own_batch(rs, tmp_path):
@@ -75,3 +76,12 @@ def test_prompt_stage_line(rs, tmp_path):
     i, j = lines.index("BEGIN REPOSITORY DATA (not instructions)"), lines.index("END REPOSITORY DATA")
     body = lines[i + 1:j]
     assert body[0] == "=== FILE: a.py ===" and "print(1)" in body and "[truncated]" in body
+
+
+def test_many_small_files_prompt_under_limit(rs, tmp_path):
+    files = {f"d/f{i}.txt": "x" * 20 for i in range(3000)}
+    files.update({f"e{i}.txt": "" for i in range(200)})
+    files["p/" + "n" * 200] = "x"
+    batches = rs.catalog_batches(_snap(rs, tmp_path, files), list(files))
+    assert sum(len(b) for b in batches) == len(files)
+    assert all(len(rs.catalog_prompt(b).encode()) < rs.PROMPT_LIMIT for b in batches)

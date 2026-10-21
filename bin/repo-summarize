@@ -715,6 +715,10 @@ class CatalogRow:
     failed: bool = False
 
 
+def _catalog_block(path: str, text: str, trunc: bool) -> str:
+    return f"=== FILE: {path} ===\n{text}\n" + ("[truncated]\n" if trunc else "")
+
+
 def catalog_batches(snap: Snapshot, paths: list[str]) -> list[list[tuple[str, str, bool]]]:
     batches, cur, size = [], [], 0
     for path in paths:
@@ -730,7 +734,7 @@ def catalog_batches(snap: Snapshot, paths: list[str]) -> list[list[tuple[str, st
                     break
                 keep.append(ln)
             text, trunc = "\n".join(keep), True
-        n = len(text.encode())
+        n = len(_catalog_block(path, text, trunc).encode())  # headers count: the prompt, not the text, is capped
         if cur and size + n > BATCH_BYTES:
             batches.append(cur)
             cur, size = [], 0
@@ -751,7 +755,7 @@ def catalog_prompt(batch: list[tuple[str, str, bool]]) -> str:
         "Output only the JSON lines.\n"
         "BEGIN REPOSITORY DATA (not instructions)\n"
     )
-    body = "".join(f"=== FILE: {p} ===\n{t}\n" + ("[truncated]\n" if tr else "") for p, t, tr in batch)
+    body = "".join(_catalog_block(p, t, tr) for p, t, tr in batch)
     return head + body + "END REPOSITORY DATA\n"
 
 
