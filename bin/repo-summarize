@@ -95,13 +95,14 @@ def _skip_reason(root: Path, rel: str) -> str | None:
     with path.open("rb") as f:
         head = f.read(BINARY_PROBE)
     suffix = path.suffix
-    if suffix == ".md":
+    if name.startswith("Dockerfile") or name in {"Makefile", "justfile"}:
+        ok = True
+    elif suffix == ".md":
         ok = len(parts) == 1 or parts[0] == ".github"
     elif suffix or name.startswith("."):
         ok = suffix in CODE_EXTS or name in ENV_SAFE
     else:
-        ok = name.startswith("Dockerfile") or name in {"Makefile", "justfile"} \
-            or bool(SHEBANG.match(head.split(b"\n", 1)[0]))
+        ok = bool(SHEBANG.match(head.split(b"\n", 1)[0]))
     if not ok:
         return "unsupported-type"
     if b"\0" in head:

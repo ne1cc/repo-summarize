@@ -58,7 +58,7 @@ def test_symlink_skipped(rs, make_repo, tmp_path):
 
 
 def test_config_types_included(rs, make_repo, tmp_path):
-    ok = ["a.yml", "Dockerfile", "Makefile", ".github/workflows/ci.yml", "README.md", ".github/PULL_REQUEST_TEMPLATE.md"]
+    ok = ["a.yml", "Dockerfile", "Dockerfile.dev", "Makefile", ".github/workflows/ci.yml", "README.md", ".github/PULL_REQUEST_TEMPLATE.md"]
     d = rs.discover(make_repo(tmp_path, {**dict.fromkeys(ok, "x\n"), "docs/guide.md": "x\n"}))
     assert d.included == sorted(ok)
     assert skipped(d, "unsupported-type") == ["docs/guide.md"]
