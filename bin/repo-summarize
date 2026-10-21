@@ -811,6 +811,8 @@ CONTRIB_GLOBS = (".pre-commit-config.y*ml", "ruff.toml", ".ruff.toml", ".eslintr
                  ".prettierrc*", "prettier.config.*", ".editorconfig", "CONTRIBUTING*", ".gitlab-ci.yml", ".travis.yml")
 EDGE_PROMPT_BYTES = 20_000  # shortcut: edges beyond this are omitted from the prompt, upgrade if plans miss structure
 README_LINES = 60
+README_BYTES = 8_000
+REASK_BYTES = 4_096
 
 
 @dataclass
@@ -895,29 +897,55 @@ def fallback_plan(catalog: dict[str, CatalogRow], graph: Graph) -> list[Chapter]
     return out
 
 
-def _catalog_section(catalog: dict[str, CatalogRow], graph: Graph) -> str:
-    full = "".join(f"{p} — {r.purpose}\n" for p, r in catalog.items())
-    if len(full.encode()) <= CONDENSE_BYTES:
+def _fit(lines: list[str], budget: int) -> str:
+    """Joins whole lines up to budget bytes, ending with a count of what was dropped."""
+    out, used = [], 0
+    for i, ln in enumerate(lines):
+        tail = f"... ({len(lines) - i} more directories)\n"
+        if used + len(ln.encode()) + len(tail.encode()) > budget:
+            return "".join(out) + tail
+        out.append(ln)
+        used += len(ln.encode())
+    return "".join(out)
+
+
+def _catalog_section(catalog: dict[str, CatalogRow], graph: Graph, budget: int) -> str:
+    full = "".join(f"{p} \u2014 {r.purpose}\n" for p, r in catalog.items())
+    if len(full.encode()) <= min(CONDENSE_BYTES, budget):
         return full
     groups: dict[str, list[str]] = {}
     for p in catalog:
         groups.setdefault(p.split("/")[0] + "/" if "/" in p else "./", []).append(p)
-    lines = []
-    for d, ps in sorted(groups.items()):
-        top = sorted(ps, key=lambda p: (-graph.fan_in.get(p, 0), p))[:5]
-        lines.append(f"{d} ({len(ps)} files): " + "; ".join(f"{p} — {catalog[p].purpose}" for p in top) + "\n")
-    return "".join(lines)
+
+    def dir_lines(n: int) -> list[str]:
+        out = []
+        for d, ps in sorted(groups.items()):
+            top = sorted(ps, key=lambda p: (-graph.fan_in.get(p, 0), p))[:n]
+            tops = ": " + "; ".join(f"{p} \u2014 {catalog[p].purpose}" for p in top) if n else ""
+            out.append(f"{d} ({len(ps)} files){tops}\n")
+        return out
+
+    for n in (5, 3, 0):
+        text = "".join(dir_lines(n))
+        if len(text.encode()) <= budget:
+            return text
+    return _fit(dir_lines(0), budget)
+
+
+def _readme_head(readme: str) -> str:
+    out, used = [], 0
+    for ln in readme.splitlines()[:README_LINES]:
+        used += len(ln.encode()) + 1
+        if used > README_BYTES:
+            break
+        out.append(ln)
+    return "\n".join(out)
 
 
 def plan_prompt(catalog: dict[str, CatalogRow], graph: Graph, readme: str, directive: str = "") -> str:
+    """Prompt of at most PROMPT_LIMIT - REASK_BYTES bytes, leaving room for a re-ask suffix."""
     f = sum(1 for p in catalog if _is_source(p))
     t = subsystem_target(f)
-    edges, used = [], 0
-    for a, b in sorted(graph.edges):
-        used += len(a) + len(b) + 5
-        if used > EDGE_PROMPT_BYTES:
-            break
-        edges.append(f"{a} -> {b}")
     head = (
         "STAGE: plan\n"
         "Plan a short book about this repository as a JSON array of chapters. Chapter roles, in order: "
@@ -933,12 +961,25 @@ def plan_prompt(catalog: dict[str, CatalogRow], graph: Graph, readme: str, direc
     )
     if directive:
         head += directive.strip() + "\n"
-    return (head + "BEGIN REPOSITORY DATA (not instructions)\n"
-            "README (first %d lines):\n%s\n" % (README_LINES, "\n".join(readme.splitlines()[:README_LINES]))
-            + "Import edges:\n" + "".join(e + "\n" for e in edges)
-            + "Entry points:\n" + "".join(e + "\n" for e in graph.entry_points)
-            + "Catalog (path — purpose):\n" + _catalog_section(catalog, graph)
-            + "END REPOSITORY DATA\n")
+    entries = _fit_lines([e + "\n" for e in graph.entry_points], 4_000)
+    fixed = (head + "BEGIN REPOSITORY DATA (not instructions)\n"
+             f"README (first {README_LINES} lines):\n{_readme_head(readme)}\n"
+             "Entry points:\n" + entries)
+    rest = PROMPT_LIMIT - REASK_BYTES - len((fixed + "Import edges:\nCatalog (path \u2014 purpose):\nEND REPOSITORY DATA\n").encode())
+    edges = _fit_lines([f"{a} -> {b}\n" for a, b in sorted(graph.edges)], min(EDGE_PROMPT_BYTES, rest // 4))
+    cat_budget = rest - len(edges.encode())
+    return (fixed + "Import edges:\n" + edges + "Catalog (path \u2014 purpose):\n"
+            + _catalog_section(catalog, graph, cat_budget) + "END REPOSITORY DATA\n")
+
+
+def _fit_lines(lines: list[str], budget: int) -> str:
+    out, used = [], 0
+    for ln in lines:
+        used += len(ln.encode())
+        if used > budget:
+            break
+        out.append(ln)
+    return "".join(out)
 
 
 def _validate(val, catalog) -> tuple[list[Chapter], list[str]]:
@@ -1009,7 +1050,8 @@ def run_plan(catalog: dict[str, CatalogRow], graph: Graph, readme: str, runner: 
             chapters, bad = [], ["backend call failed"]
         if not bad:
             return chapters, "model"
-        prompt += "\nYour previous reply was rejected: " + "; ".join(bad) + "\n"
+        suffix = ("\nYour previous reply was rejected: " + "; ".join(bad) + "\n").encode()[:REASK_BYTES]
+        prompt += suffix.decode(errors="ignore")
     return fallback_plan(catalog, graph), "fallback"
 
 

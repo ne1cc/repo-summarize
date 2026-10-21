@@ -67,8 +67,7 @@ def test_missing_role_reask_then_fallback(rs, stub, monkeypatch, tmp_path):
     assert how == "fallback" and len(_calls(log)) == 2
     roles = [c.role for c in chapters]
     assert roles[0] == "orientation" and roles[1] == "main_flow" and roles[-1] == "contributing"
-    assert [c.title for c in chapters if c.role == "subsystem"] == ["lib", "src"] or \
-        [c.title for c in chapters if c.role == "subsystem"] == ["lib"]
+    assert [c.title for c in chapters if c.role == "subsystem"] == ["lib", "src"]
     assert ".github/workflows/ci.yml" in chapters[-1].primary and "README.md" in chapters[0].primary
 
 
@@ -187,3 +186,54 @@ def test_reused_without_model_call(rs, stub, monkeypatch, tmp_path):
     assert how == "reused" and got == plan and not _calls(log)
     _, how = rs.run_plan(_cat(rs, files), g, "", r, plan, True, cached_meta=meta)
     assert how == "fallback" and len(_calls(log)) == 2
+
+
+class _FakeRunner:
+    def __init__(self, replies):
+        self.replies, self.prompts = list(replies), []
+
+    def ask_json(self, stage, prompt):
+        self.prompts.append(prompt)
+        r = self.replies.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+
+def test_prompt_bounded_worst_case(rs):
+    files = [f"d{i % 2000}/sub/file{i}.py" for i in range(3000)]
+    cat = {p: rs.CatalogRow(p, "word " * 18, [], False) for p in files}
+    g = rs.Graph({(files[i], files[i + 1]) for i in range(2999)} | {(files[i], files[i + 2]) for i in range(2000)},
+                 set(), files[:5], [], {p: i for i, p in enumerate(files)})
+    readme = "\n".join("r" * 5000 for _ in range(60))
+    fake = _FakeRunner([[], []])
+    _, how = rs.run_plan(cat, g, readme, fake, None, False)
+    assert how == "fallback" and len(fake.prompts) == 2
+    for p in fake.prompts:
+        assert len(p.encode()) <= rs.PROMPT_LIMIT
+    assert fake.prompts[1].startswith(fake.prompts[0]) and "rejected" in fake.prompts[1]
+
+
+def test_prompt_degrades_to_truncated_directory_list(rs):
+    files = [f"d{i}/f.py" for i in range(8000)]
+    cat = {p: rs.CatalogRow(p, "w", [], False) for p in files}
+    p = rs.plan_prompt(cat, _graph(rs), "")
+    assert len(p.encode()) <= rs.PROMPT_LIMIT - rs.REASK_BYTES and "more directories)" in p
+
+
+def test_call_failed_twice_falls_back(rs):
+    fake = _FakeRunner([rs.CallFailed("x"), rs.CallFailed("x")])
+    _, how = rs.run_plan(_cat(rs, FILES), _graph(rs), "", fake, None, False)
+    assert how == "fallback" and len(fake.prompts) == 2
+
+
+def test_capped_propagates(rs):
+    import pytest
+    with pytest.raises(rs.Capped):
+        rs.run_plan(_cat(rs, FILES), _graph(rs), "", _FakeRunner([rs.Capped("cap")]), None, False)
+
+
+def test_reask_contains_violations(rs):
+    fake = _FakeRunner([json.loads(json.dumps(_good()[:3])), _good()])
+    _, how = rs.run_plan(_cat(rs, FILES), _graph(rs), "", fake, None, False)
+    assert how == "model" and "Your previous reply was rejected: missing role contributing" in fake.prompts[1]
