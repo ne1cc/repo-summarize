@@ -6,6 +6,8 @@
 """repo-summarize: turn a repo into a short book of Markdown docs."""
 import argparse
 import fnmatch
+import hashlib
+import json
 import os
 import re
 import subprocess
@@ -123,6 +125,71 @@ def discover(root: Path) -> Discovery:
             d.included.append(rel)
     d.included.sort()
     return d
+
+
+REDACTED = "[REDACTED]"
+PEM_BEGIN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+PEM_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
+SECRET_RE = re.compile(
+    r"AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36,}|sk-[A-Za-z0-9_-]{20,}|xox[abpr]-[A-Za-z0-9-]+"
+    r"|(?P<key>(?i:password|secret|token|api_?key)\s*[:=]\s*['\"]?)[^\s'\"]{8,}")
+
+
+def redact_text(text: str) -> tuple[str, int]:
+    out, count, in_pem = [], 0, False
+    for line in text.split("\n"):
+        if in_pem or PEM_BEGIN.search(line):
+            count += not in_pem
+            in_pem = not PEM_END.search(line)
+            out.append(REDACTED)
+            continue
+        line, n = SECRET_RE.subn(lambda m: (m["key"] or "") + REDACTED, line)
+        count += n
+        out.append(line)
+    return "\n".join(out), count
+
+
+def scan_secret(text: str) -> bool:
+    return redact_text(text)[1] > 0
+
+
+@dataclass
+class Snapshot:
+    dir: Path
+    sha256: dict[str, str]
+    manifest_sha256: str
+
+
+def take_snapshot(disc: Discovery, run_dir: Path) -> Snapshot:
+    snap = run_dir / "snapshot"
+    snap.mkdir(mode=0o700, parents=True, exist_ok=True)
+    shas = {}
+    for rel in disc.included:
+        raw = (disc.root / rel).read_bytes()
+        shas[rel] = hashlib.sha256(raw).hexdigest()
+        dest = snap / rel
+        for d in reversed([p for p in dest.parents if snap in p.parents]):
+            d.mkdir(mode=0o700, exist_ok=True)
+        red, _ = redact_text(raw.decode("utf-8", "surrogateescape"))
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(red.encode("utf-8", "surrogateescape"))
+        dest.chmod(0o600)
+    manifest = hashlib.sha256(json.dumps(sorted(shas.items()), separators=(",", ":")).encode()).hexdigest()
+    return Snapshot(snap, shas, manifest)
+
+
+def read_snapshot(snap: Snapshot, path: str) -> list[str]:
+    return (snap.dir / path).read_bytes().decode("utf-8", "replace").splitlines()
+
+
+def changed_since_snapshot(disc: Discovery, snap: Snapshot) -> list[str]:
+    def sha(rel: str) -> str | None:
+        try:
+            return hashlib.sha256((disc.root / rel).read_bytes()).hexdigest()
+        except OSError:
+            return None
+    return sorted(rel for rel in disc.included if sha(rel) != snap.sha256.get(rel))
 
 
 @dataclass(frozen=True)
