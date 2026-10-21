@@ -39,20 +39,35 @@ def test_shim_one_hop(rs, make_repo, tmp_path):
     assert g.fan_in["real.py"] == 2
 
 
-def test_entry_points(rs, make_repo, tmp_path):
+def test_entry_points_pyproject(rs, make_repo, tmp_path):
     g = build(rs, make_repo, tmp_path, {
-        "pkg/__main__.py": "", "pkg/cli.py": "", "app.py": "",
-        "pyproject.toml": '[project.scripts]\nx = "pkg.cli:main"\n',
-        "Dockerfile": 'FROM python\nCMD ["python","app.py"]\n', "other.py": ""})
-    assert g.entry_points == ["app.py", "pkg/__main__.py", "pkg/cli.py"]
+        "pkg/tool.py": "", "pkg/other.py": "", "pyproject.toml": '[project.scripts]\nx = "pkg.tool:main"\n'})
+    assert g.entry_points == ["pkg/tool.py"]
 
 
-def test_entry_points_bin_and_malformed(rs, make_repo, tmp_path):
+def test_entry_points_dockerfile(rs, make_repo, tmp_path):
     g = build(rs, make_repo, tmp_path, {
-        "package.json": '{"bin": {"t": "./tools/t.js"}}', "tools/t.js": "", "Dockerfile.x": "ENTRYPOINT python tools/t.js\n"})
+        "run.py": "", "other.py": "", "Dockerfile": 'FROM python\nCMD ["python","run.py"]\n'})
+    assert g.entry_points == ["run.py"]
+
+
+def test_entry_points_package_bin(rs, make_repo, tmp_path):
+    g = build(rs, make_repo, tmp_path, {
+        "package.json": '{"bin": {"t": "./tools/t.js"}}', "tools/t.js": "", "tools/u.js": ""})
     assert g.entry_points == ["tools/t.js"]
-    g = build(rs, make_repo, tmp_path / "m", {"package.json": "{bad", "pyproject.toml": "[[[", "x.py": ""})
-    assert g.entry_points == []
+
+
+def test_entry_points_names_and_malformed(rs, make_repo, tmp_path):
+    g = build(rs, make_repo, tmp_path, {
+        "pkg/__main__.py": "", "app.json": "{}", "index.yml": "a: 1\n", "x.py": "",
+        "package.json": "{bad", "pyproject.toml": "[[["})
+    assert g.entry_points == ["pkg/__main__.py"]
+
+
+def test_workflow_run_quoting(rs, make_repo, tmp_path):
+    snap, inc = graph(rs, make_repo, tmp_path, {
+        ".github/workflows/ci.yml": "steps:\n  - run: echo \"hi\"\n  - run: 'make x'\n"})
+    assert rs.manifest_commands(snap, inc) == ['echo "hi"', "make x"]
 
 
 def test_manifest_commands(rs, make_repo, tmp_path):

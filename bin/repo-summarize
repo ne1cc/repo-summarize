@@ -318,7 +318,7 @@ def _entry_points(snap: Snapshot, included: list[str]) -> list[str]:
     inc, found = set(included), set()
     for p in included:
         name, _, ext = Path(p).name.rpartition(".")
-        if name in ENTRY_NAMES and f".{ext}" in CODE_EXTS:
+        if name in ENTRY_NAMES and f".{ext}" in CODE_EXTS - CONFIG_EXTS:
             found.add(p)
     scripts = _toml(snap, "pyproject.toml", included).get("project", {}).get("scripts", {})
     for target in scripts.values() if isinstance(scripts, dict) else []:
@@ -381,8 +381,8 @@ def _workflow_runs(lines: list[str]) -> list[str]:
                 if (s := lines[i].strip()) and not s.startswith("#"):
                     out.append(s)
                 i += 1
-        elif val.strip("'\""):
-            out.append(val.strip("'\""))
+        elif val:
+            out.append(val[1:-1] if len(val) > 1 and val[0] == val[-1] and val[0] in "'\"" else val)
     return out
 
 
