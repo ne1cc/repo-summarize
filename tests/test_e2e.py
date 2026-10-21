@@ -130,12 +130,16 @@ def test_missing_backend_exit_1_lock_released(rs, tool, capsys):
     assert not (repo / STATE / "lock").exists() and not (repo / ARCH).exists()
 
 
-def test_probe_access_exit_5(rs, tool, monkeypatch):
+def test_probe_access_exit_5(rs, tool, monkeypatch, capsys):
     repo = tool.repo()
     monkeypatch.setattr(rs.secrets, "token_hex", lambda n=16: "ab" * n)
     tool.scenario(book_scenario(probe="ab" * 16))
     assert tool.run(repo) == (rs.EXIT_UNSAFE, [])
+    err = capsys.readouterr().err
+    assert "$HOME" in err and "stopped" in err
     assert not (repo / ARCH).exists() and not (repo / STATE / "lock").exists()
+    rec = repo / STATE / "probe.json"
+    assert not rec.exists() or "probe-access-observed" not in rec.read_text()
 
 
 def test_live_lock_exit_1(rs, tool, capsys):

@@ -138,3 +138,44 @@ def test_validate_staging(rs):
     assert "03-contributing.md" in text and "missing.md" in text and "provenance.json" in text
     assert "a.py" in text  # primary twice
     assert "nope.md" not in text and "(y)" not in text and "../../a.py" not in text
+
+
+def _journal_fails_on_moved_old(rs, monkeypatch):
+    real = rs._journal
+
+    def journal(state, run_id, step):
+        if step == "moved-old":
+            raise OSError("no space left on device")
+        return real(state, run_id, step)
+
+    monkeypatch.setattr(rs, "_journal", journal)
+    return real
+
+
+def _book_with_notes(rs, tool):
+    repo = tool.repo()
+    tool.scenario(book_scenario())
+    assert tool.run(repo)[0] == 0
+    (repo / ARCH / "notes.md").write_text("mine\n")
+    return repo, _tree(repo / ARCH)
+
+
+def test_journal_failure_after_move_restored_in_process(rs, tool, monkeypatch):
+    repo, old = _book_with_notes(rs, tool)
+    _journal_fails_on_moved_old(rs, monkeypatch)
+    assert tool.run(repo)[0] == rs.EXIT_FAIL
+    assert _tree(repo / ARCH) == old and not (repo / STATE / "publish.json").exists()
+
+
+def test_journal_failure_after_move_restored_next_run(rs, tool, monkeypatch):
+    repo, old = _book_with_notes(rs, tool)
+    real_journal = _journal_fails_on_moved_old(rs, monkeypatch)
+    real_recover = rs.recover
+    monkeypatch.setattr(rs, "recover", lambda root, state: None)
+    assert tool.run(repo)[0] == rs.EXIT_FAIL
+    assert not (repo / ARCH).exists()
+    assert json.loads((repo / STATE / "publish.json").read_text())["step"] == "prepared"
+    monkeypatch.setattr(rs, "_journal", real_journal)
+    monkeypatch.setattr(rs, "recover", real_recover)
+    assert tool.run(repo, "--status") == (0, [])
+    assert _tree(repo / ARCH) == old and not (repo / STATE / "publish.json").exists()

@@ -2058,7 +2058,10 @@ def _journal(state: Path, run_id: str, step: str) -> None:
 
 
 def recover(root: Path, state: Path) -> str | None:
-    """Finishes or undoes an interrupted publish (§10 step 6). Returns the action taken, or None."""
+    """Finishes or undoes an interrupted publish (§10 step 6). Returns the action taken, or None.
+
+    Limits: a journal step names the last step recorded, not the last step done, so the filesystem is checked.
+    """
     journal = state / "publish.json"
     try:
         doc = json.loads(journal.read_text())
@@ -2069,11 +2072,12 @@ def recover(root: Path, state: Path) -> str | None:
         journal.unlink(missing_ok=True)
         return "discarded an unreadable publish journal"
     arch, prev = root / RENDER_DIR, state / "runs" / run_id / "previous"
-    # 1. moved-old with the book missing → the kill came between the renames; put the old book back
-    if step == "moved-old" and not arch.exists() and prev.exists():
+    # 1. Disk state, not the step, decides: the old book may be moved aside before the journal records it
+    #    (a kill or failed journal write right after rename c), so book missing + previous present → put it back
+    if not arch.exists() and prev.exists():
         prev.rename(arch)
-        action = f"restored {RENDER_DIR} from run {run_id}"
-    else:  # prepared → nothing moved yet; done (or moved-old with the new book in place) → finished
+        action = f"restored {RENDER_DIR} from run {run_id} (step {step})"
+    else:  # nothing moved yet, or the new book is in place → just finish
         action = f"cleared publish journal of run {run_id} (step {step})"
     journal.unlink()
     return action
@@ -2236,7 +2240,7 @@ def _status(root: Path, state: Path, action: str | None) -> int:
 
 
 def _probe_once(b: Backend, state: Path) -> str:
-    """The probe result for this backend fingerprint; probes only when the fingerprint changed."""
+    """The probe result for this backend fingerprint; probes when the fingerprint changed or access was seen."""
     rec_path = state / "probe.json"
     try:
         rec = json.loads(rec_path.read_text())
@@ -2245,7 +2249,10 @@ def _probe_once(b: Backend, state: Path) -> str:
     except (OSError, ValueError, KeyError, TypeError):
         pass
     result = probe(b, Path.home())
-    rec_path.write_text(json.dumps({"fingerprint": b.fingerprint, "result": result}))
+    if result == "probe-access-observed":  # not cached: the next run probes again once the sandbox is fixed
+        rec_path.unlink(missing_ok=True)
+    else:
+        rec_path.write_text(json.dumps({"fingerprint": b.fingerprint, "result": result}))
     return result
 
 
@@ -2258,7 +2265,8 @@ def _build(opts: Options, root: Path, state: Path, run_dir: Path, run_id: str) -
     backend = make_backend(os.environ, opts.unsafe_backend, deny_paths=[root, state])
     probe_result = _probe_once(backend, state)
     if probe_result == "probe-access-observed" and backend.sandbox != "none":
-        raise BackendUnsafe("the probe read a file outside the sandbox: the sandbox is not working")
+        raise BackendUnsafe("the sandbox let the backend read a file under $HOME; the run was stopped "
+                            "and nothing was published")
     runner = Runner(backend, state, opts.max_calls, opts.force, log_path=run_dir / "log.jsonl")
     # 2. Catalog, plan (persisted unless reused or fallback, so the model gets another chance), attach
     readme = "\n".join(read_snapshot(snap, "README.md")) if "README.md" in disc.included else ""
