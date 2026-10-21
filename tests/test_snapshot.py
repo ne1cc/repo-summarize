@@ -64,3 +64,10 @@ def test_read_snapshot_splits_on_newline_only(rs, make_repo, tmp_path):
     assert rs.read_snapshot(s, "a.py") == ["a\x0cb", "c"]
     assert len(rs.read_snapshot(s, "b.py")) == 1
     assert rs.read_snapshot(s, "c.py") == ["a", "b"]
+
+
+def test_redact_keeps_kebab_case_and_catches_pgp(rs):
+    for code in ["import x from './task-queue-worker-manager'", "src/disk-usage-reporter-daemon.ts"]:
+        assert rs.redact_text(code) == (code, 0)
+    pgp = "-----BEGIN PGP PRIVATE KEY BLOCK-----\nAAAA\n-----END PGP PRIVATE KEY BLOCK-----"
+    assert rs.redact_text(pgp)[0].split("\n") == ["[REDACTED]"] * 3

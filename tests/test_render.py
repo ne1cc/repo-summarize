@@ -377,3 +377,5 @@ def test_index_title_prefers_github_repo_name(rs, tmp_path):
     assert rs._index_md(ctx, None)[0].startswith("# real-name\n")
     ctx.gi = rs.GitInfo(None, None, False, None, set())
     assert rs._index_md(ctx, None)[0].startswith("# worktree-dir\n")
+    ctx.gi = rs.GitInfo("c" * 40, "main", False, ("o", "monorepo"), set(), "pkg/")
+    assert rs._index_md(ctx, None)[0].startswith("# worktree-dir\n")  # subdirectory run: the package's name

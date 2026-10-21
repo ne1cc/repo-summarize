@@ -143,10 +143,10 @@ def discover(root: Path) -> Discovery:
 
 
 REDACTED = "[REDACTED]"
-PEM_BEGIN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
-PEM_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
+PEM_BEGIN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY( BLOCK)?-----")
+PEM_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY( BLOCK)?-----")
 SECRET_RE = re.compile(
-    r"AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36,}|sk-[A-Za-z0-9_-]{20,}|xox[abpr]-[A-Za-z0-9-]+"
+    r"AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36,}|(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}|xox[abpr]-[A-Za-z0-9-]+"
     r"|(?P<key>(?i:password|secret|token|api_?key)\s*[:=]\s*['\"]?)[^\s'\"]{8,}")
 
 
@@ -749,7 +749,8 @@ def catalog_batches(snap: Snapshot, paths: list[str]) -> list[list[tuple[str, st
                 if used > BATCH_BYTES:
                     break
                 keep.append(ln)
-            text, trunc = "\n".join(keep), True
+            # a single line over the budget (minified/generated data) → a byte slice, not an empty file
+            text, trunc = "\n".join(keep) or lines[0].encode()[:BATCH_BYTES].decode(errors="ignore"), True
         n = len(_catalog_block(path, text, trunc).encode())  # headers count: the prompt, not the text, is capped
         if cur and size + n > BATCH_BYTES:
             batches.append(cur)
@@ -1899,7 +1900,7 @@ def _render_chapter(ctx: _Ctx, i: int, ch: Chapter, reply: dict | None) -> tuple
 
 def _index_md(ctx: _Ctx, index_reply: dict | None) -> tuple[str, list[str]]:
     notes: list[str] = []
-    parts = [f"# {_line(ctx.gi.github[1] if ctx.gi.github else Path(ctx.repo).name)}"]  # worktree dirs aren't names
+    parts = [f"# {_line(ctx.gi.github[1] if ctx.gi.github and not ctx.gi.prefix else Path(ctx.repo).name)}"]  # worktree dirs aren't names
     if index_reply is None:
         notes.append("index generation failed")
         parts.append("Overview unavailable — index generation failed.")

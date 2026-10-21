@@ -106,3 +106,10 @@ def test_catalog_reask_after_tool_denied(rs, tmp_path):
     rows = rs.run_catalog(snap, ["a.py"], R())
     assert not rows["a.py"].failed
     assert rs.TOOL_RETRY in prompts[1] and rs.TOOL_RETRY not in prompts[0]
+
+
+def test_single_long_first_line_keeps_a_slice(rs, tmp_path):
+    files = {"data.json": "[" + "1," * 35_000 + "1]\n"}
+    (b,) = rs.catalog_batches(_snap(rs, tmp_path, files), list(files))
+    _, text, trunc = b[0]
+    assert trunc and text.startswith("[1,1,") and len(text.encode()) <= rs.BATCH_BYTES
