@@ -117,7 +117,7 @@ That's about 21 calls for the spike repo, against about 124 for v1.
   - `symlink`;
   - `unsafe-path` (control characters including tab or newline, a backtick, `|`);
   - `binary` (NUL in the first 8 KB);
-  - `too-large` (> 100 KB);
+  - `too-large` (> 1 MB; catalog and attach truncate larger inputs);
   - `lockfile`;
   - `minified`;
   - `generated-docs` (`docs/architecture/**`, `docs/.repo-summarize/**`);

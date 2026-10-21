@@ -32,7 +32,7 @@ PROMPT_LIMIT = 110_000
 BATCH_BYTES = 60_000
 FILE_LINES = 400
 CONDENSE_BYTES = 80_000
-MAX_FILE = 100_000
+MAX_FILE = 1_000_000  # catalog and attach truncate; this only stops pathological files
 BINARY_PROBE = 8192
 BUDGET_INSTR = 8_000
 BUDGET_CATALOG = 12_000
@@ -69,7 +69,7 @@ LOCKFILES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "C
 ENV_SAFE = {".env.example", ".env.sample", ".env.template"}
 SECRET_GLOBS = ("*.pem", "*.key", "*.p12", "*id_rsa*", "*credentials*.json")
 UNSAFE_PATH = re.compile(r"[\x00-\x1f\x7f`|]")
-SHEBANG = re.compile(rb"#!.*\b(bash|sh|zsh|python\d*|node|ruby|perl)\b")
+SHEBANG = re.compile(rb"#!.*\b(bash|sh|zsh|python\d*|node|ruby|perl|uv)\b")
 
 
 @dataclass

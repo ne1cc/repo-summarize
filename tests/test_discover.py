@@ -6,8 +6,9 @@ def skipped(d, reason):
 
 
 def test_shebang_script_included(rs, make_repo, tmp_path):
-    d = rs.discover(make_repo(tmp_path, {"bin/tool": "#!/usr/bin/env bash\necho\n", "bin/other": "plain\n"}))
-    assert "bin/tool" in d.included
+    d = rs.discover(make_repo(tmp_path, {"bin/tool": "#!/usr/bin/env bash\necho\n", "bin/other": "plain\n",
+                                         "bin/uvtool": "#!/usr/bin/env -S uv run --script\nx = 1\n"}))
+    assert "bin/tool" in d.included and "bin/uvtool" in d.included
     assert "bin/other" in skipped(d, "unsupported-type")
 
 
@@ -32,6 +33,7 @@ def test_binary_and_large(rs, make_repo, tmp_path):
     d = rs.discover(make_repo(tmp_path, {"b.py": b"x\x00y", "big.py": big, "ok.py": "a" * rs.MAX_FILE}))
     assert skipped(d, "binary") == ["b.py"]
     assert skipped(d, "too-large") == ["big.py"]
+    assert rs.MAX_FILE >= 1_000_000  # a large core module must still reach the (truncating) catalog
     assert d.included == ["ok.py"]
 
 
