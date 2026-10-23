@@ -379,3 +379,16 @@ def test_index_title_prefers_github_repo_name(rs, tmp_path):
     assert rs._index_md(ctx, None)[0].startswith("# worktree-dir\n")
     ctx.gi = rs.GitInfo("c" * 40, "main", False, ("o", "monorepo"), set(), "pkg/")
     assert rs._index_md(ctx, None)[0].startswith("# worktree-dir\n")  # subdirectory run: the package's name
+
+
+def test_excerpt_trimmed_to_end_of_definition(rs, tmp_path):
+    d = tmp_path / "s"
+    d.mkdir()
+    (d / "a.py").write_text("def a():\n    return 1\n\n\ndef b():\n    return 2\n")
+    ch = rs.Chapter("subsystem", "s", "S", "w", ["a.py"], shown={"a.py": [(1, 6)]})
+    gi = rs.GitInfo(None, None, False, None, set())
+    snap = rs.Snapshot(d, {}, "")
+    md, labels = rs.resolve_ref({"start": 1, "end": 6}, "a.py", ch, snap, gi, "docs/architecture")
+    assert "return 1" in md and "def b" not in md and "a.py:1-2" in md and labels == ["reference-valid", "source-excerpt-attached"]
+    md, _ = rs.resolve_ref({"start": 2, "end": 6}, "a.py", ch, snap, gi, "docs/architecture")
+    assert "def b" in md  # starts mid-function: nothing safe to snap to

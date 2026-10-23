@@ -6,6 +6,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 
 ### Changed
+- Chapter source budget: a primary file too large to show in full now gets whole function bodies, not just signatures. Spare prompt room goes to definitions that are used often or call many other definitions (orchestrators), so main-flow steps are no longer mostly `not-shown`.
+- Code excerpts that start on a top-level definition end where that definition ends, instead of running into the next one.
 - Prompts require every diagram to be a fenced `mermaid` block (no ASCII or box-drawing art) with quoted punctuation labels, so diagrams render in Markdown viewers.
 
 ### Added

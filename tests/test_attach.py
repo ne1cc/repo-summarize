@@ -238,8 +238,9 @@ def test_budget_bound(rs, tmp_path):
     assert sum(len(c.encode()) for c in files.values()) > 5 * 86_000
     assert _cost(rs, ch, snap) <= rs.PROMPT_LIMIT - fixed
     assert ch.shown["src/half_hi.py"] == [(1, 500)] and ch.shown["src/small.py"] == [(1, 2)]
-    for i in range(5):  # signatures only, never dropped
-        assert ch.shown[f"src/big{i}.py"] == [(n, n) for n in range(1, 1001, 100)]
+    for i in range(5):  # signatures are never dropped; spare room may add bodies around them
+        got = {n for s, e in ch.shown[f"src/big{i}.py"] for n in range(s, e + 1)}
+        assert set(range(1, 1001, 100)) <= got and len(got) < 1000
     assert ch.shown["src/rel.py"] == [(1, 40)]
     assert {"src/nosig.py", "src/half_lo.py"} <= set(ch.not_shown)  # lower fan-in lost the full slot
     assert set(ch.not_shown) == {p for p in prim + ["src/rel.py"] if not ch.shown.get(p)}
@@ -249,3 +250,39 @@ def test_attach_fills_budget(rs, tmp_path):
     chapters, _ = _run(rs, tmp_path, ["src/main.py", "src/a.py"], _book(rs, flow=["src/main.py", "src/a.py"]),
                        entry=["src/main.py"])
     assert _by(chapters)["main-flow"].shown == {"src/main.py": [(1, 1)], "src/a.py": [(1, 1)]}
+
+
+def test_def_spans(rs):
+    py = ["import x", "", "@dec", "def a():", "    return 1", "", "    # c", "def b():", "    pass", "", "X = 1",
+          "class C:", "    def m(self):", "        pass"]
+    assert rs._def_spans(py) == [("a", 4, 7), ("b", 8, 9), ("C", 12, 14)]
+    js = ["function f() {", "  return 1;", "}", "", "function g() {", "}"]
+    assert rs._def_spans(js) == [("f", 1, 3), ("g", 5, 6)]
+
+
+def test_budget_adds_hot_bodies_after_signatures(rs, tmp_path):
+    pad = "    hot()  # filler filler filler filler filler filler filler filler filler\n"
+    big = "def hot():\n    return 1\n" + "".join(f"def cold{i}():\n" + pad * 29 for i in range(40))
+    snap = _snap(rs, tmp_path, {"src/big.py": big})
+    ch = rs.Chapter("subsystem", "s", "S", "w", ["src/big.py"], [])
+    fixed = rs.BUDGET_INSTR + rs.BUDGET_CATALOG + rs.BUDGET_TESTS
+    rs.fill_budget(ch, snap, rs.Graph(set(), set(), [], [], {}), fixed)
+    shown = {n for s, e in ch.shown["src/big.py"] for n in range(s, e + 1)}
+    lines = big.split("\n")
+    assert _cost(rs, ch, snap) <= rs.PROMPT_LIMIT - fixed
+    assert {1, 2} <= shown  # hot: the most referenced name wins first
+    assert all(n in shown for n, ln in enumerate(lines, 1) if ln.startswith("def "))  # signatures never dropped
+    assert len(shown) > 800 and len(shown) < len(lines)  # spare room used, still partial
+
+
+def test_budget_prefers_orchestrators_over_equally_referenced_leaves(rs, tmp_path):
+    pad = "    x = 1  # filler filler filler filler filler filler filler filler filler filler filler\n"
+    leaves = "".join(f"def leaf{i}():\n" + pad * 28 for i in range(30))
+    calls = "".join(f"    leaf{i}()\n" for i in range(30))
+    big = leaves + "def orchestrate():\n" + calls + pad * 60  # called by nothing, but it calls 30 definitions
+    snap = _snap(rs, tmp_path, {"src/big.py": big})
+    ch = rs.Chapter("main_flow", "m", "M", "w", ["src/big.py"], [])
+    rs.fill_budget(ch, snap, rs.Graph(set(), set(), [], [], {}), 100_000)  # room for ~10 KB: a few bodies at most
+    start = next(n for n, ln in enumerate(big.split("\n"), 1) if ln == "def orchestrate():")
+    got = {n for s, e in ch.shown["src/big.py"] for n in range(s, e + 1)}
+    assert set(range(start, start + 31)) <= got  # the orchestrator's calls are visible

@@ -1113,6 +1113,7 @@ def load_plan(state_dir: Path) -> tuple[list[Chapter], dict] | None:
 
 SIG_RE = re.compile(r"^\s*(async\s+)?(def|class|function|func|fn|export\s+(function|class)|CREATE)\b|^[A-Za-z_][\w-]*:")
 DEF_RE = re.compile(r"^\s*(async\s+)?(def|class|function|export)\b")
+DEF_NAME = re.compile(r"^(?:async\s+|export\s+(?:default\s+)?)*(?:def|class|function|func|fn)\s+\*?(\w+)")
 MARKER_NAMES = {"__init__.py", "index.js", "index.ts"}
 RELATED_HEAD = 40
 DIRECTIVE_BYTES = 1_000
@@ -1301,6 +1302,25 @@ def attach(chapters: list[Chapter], graph: Graph, catalog: dict[str, CatalogRow]
     return out, excluded
 
 
+def _def_spans(lines: list[str]) -> list[tuple[str, int, int]]:
+    """(name, start, end) 1-based for each column-0 definition; a body runs until the next column-0 line that
+    isn't a closer. shortcut: indentation-based, brace languages written at column 0 get their closer only."""
+    out, i = [], 0
+    while i < len(lines):
+        m = DEF_NAME.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        j = i + 1
+        while j < len(lines) and (not lines[j].strip() or lines[j][0] in " \t)]}"):
+            j += 1
+        while j > i + 1 and not lines[j - 1].strip():
+            j -= 1
+        out.append((m[1], i + 1, j))
+        i = j
+    return out
+
+
 def _render_cost(path: str, lines: list[str], ranges: list[tuple[int, int]]) -> int:
     """Bytes of the line-numbered rendering of ranges, plus the per-file header."""
     return len(f"=== {path} ===\n".encode()) + sum(
@@ -1320,6 +1340,33 @@ def fill_budget(ch: Chapter, snap: Snapshot, graph: Graph, fixed_bytes: int) -> 
             ch.shown[p] = ranges
             room -= cost
 
+    def add_bodies(p: str) -> None:
+        nonlocal room
+        lines, joined = text[p], "\n".join(text[p])
+        covered = {n for s, e in ch.shown[p] for n in range(s, e + 1)}
+        spans = _def_spans(lines)
+        names = {n for n, _, _ in spans}
+        word = lambda name, text: len(re.findall(r"\b" + re.escape(name) + r"\b", text))
+        # 1. Score = times the name is used (helpers) + other definitions its body calls (orchestrators)
+        score = {n: word(n, joined) + sum(1 for m in names - {n} if word(m, "\n".join(lines[a:b])))
+                 for n, a, b in spans}
+        grew = False
+        for name, a, b in sorted(spans, key=lambda d: (-score[d[0]], d[1])):
+            new = [n for n in range(a, b + 1) if n not in covered]
+            cost = sum(len(f"{n:>5}  {lines[n - 1]}\n".encode()) for n in new)
+            if new and cost <= room:
+                covered.update(new)
+                room -= cost
+                grew = True
+        if grew:  # contiguous runs, so a body and its signature are one range
+            ns, runs = sorted(covered), []
+            for n in ns:
+                if runs and runs[-1][1] == n - 1:
+                    runs[-1] = (runs[-1][0], n)
+                else:
+                    runs.append((n, n))
+            ch.shown[p] = runs
+
     prim = sorted(ch.primary, key=lambda p: (-graph.fan_in.get(p, 0), p))
     # 1. Primary files in full, highest fan-in first
     for p in prim:
@@ -1328,6 +1375,10 @@ def fill_budget(ch: Chapter, snap: Snapshot, graph: Graph, fixed_bytes: int) -> 
     for p in prim:
         if p not in ch.shown:
             offer(p, [(n, n) for n, ln in enumerate(text[p], 1) if SIG_RE.match(ln)])
+    # 2b. Spare room goes to whole definitions of the partial primaries, most-referenced names first
+    for p in prim:
+        if p in ch.shown and ch.shown[p] != [(1, len(text[p]))]:
+            add_bodies(p)
     # 3. The head of each related file
     for p in ch.related:
         offer(p, [(1, min(RELATED_HEAD, len(text[p])))])
@@ -1640,6 +1691,9 @@ def resolve_ref(ref: dict, path: str, ch: Chapter, snap: Snapshot, gi: GitInfo,
         return None, ["out of range"]
     if b - a + 1 > REF_MAX:
         return None, [f"longer than {REF_MAX} lines"]
+    # 2b. A reference that starts on a definition ends where that definition ends
+    end = next((e for _, s0, e in _def_spans(lines) if s0 == a), b)
+    b = max(a, min(b, end))
     # 3. not-shown when any cited line was outside what the model saw
     labels = ["reference-valid", "source-excerpt-attached"]
     shown = ch.shown.get(path, [])
