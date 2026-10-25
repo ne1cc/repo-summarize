@@ -38,7 +38,7 @@ The backend is called in Catalog, Plan, Chapters and Index, plus one probe call 
 
 ```bash
 git clone https://github.com/ne1cc/repo-summarize.git
-ln -s "$PWD/repo-summarize/bin/repo-summarize" ~/.local/bin/repo-summarize
+./repo-summarize/install.sh
 ```
 
 Requires [`uv`](https://docs.astral.sh/uv/) (the script header declares Python >= 3.12 and no dependencies), `git` recommended, and an AI CLI with a print mode.
