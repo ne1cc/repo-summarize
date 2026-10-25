@@ -2278,6 +2278,10 @@ def _err(msg: str) -> None:
     print(f"repo-summarize: {msg}", file=sys.stderr)
 
 
+def _say(msg: str) -> None:
+    print(f"repo-summarize: {msg}", file=sys.stderr, flush=True)
+
+
 def _estimate(disc: Discovery) -> int:
     tmp = Path(tempfile.mkdtemp(prefix="repo-summarize-estimate-"))
     try:
@@ -2337,10 +2341,12 @@ def _probe_once(b: Backend, state: Path) -> str:
 def _build(opts: Options, root: Path, state: Path, run_dir: Path, run_id: str) -> int:
     """Stages 0-8 (§5) for one run; exceptions propagate to run_pipeline for the exit code."""
     # 1. Discover + snapshot, then the backend check (sandbox policy, probe on a fingerprint change)
+    _say("snapshotting the repo")
     disc = discover(root)
     snap = take_snapshot(disc, run_dir)
     graph = build_graph(snap, disc.included)
     backend = make_backend(os.environ, opts.unsafe_backend, deny_paths=[root, state])
+    _say("probing the backend sandbox")
     probe_result = _probe_once(backend, state)
     if probe_result == "probe-access-observed" and backend.sandbox != "none":
         raise BackendUnsafe("the sandbox let the backend read a file under $HOME; the run was stopped "
@@ -2348,25 +2354,32 @@ def _build(opts: Options, root: Path, state: Path, run_dir: Path, run_id: str) -
     runner = Runner(backend, state, opts.max_calls, opts.force, log_path=run_dir / "log.jsonl")
     # 2. Catalog, plan (persisted unless reused or fallback, so the model gets another chance), attach
     readme = "\n".join(read_snapshot(snap, "README.md")) if "README.md" in disc.included else ""
+    _say("cataloging files")
     catalog = run_catalog(snap, disc.included, runner)
     cached = load_plan(state)
+    _say("planning chapters")
     chapters, how = run_plan(catalog, graph, readme, runner, cached[0] if cached else None, opts.replan,
                              cached[1] if cached else None)
     if how == "model":
         save_plan(state, chapters, graph.edges, graph.entry_points, top_dirs(disc.included))
+    _say("attaching excerpts")
     chapters, exclusions = attach(chapters, graph, catalog, snap, disc.included, runner, readme)
     # 3. Chapters in order, then the index
     commands = manifest_commands(snap, disc.included)
+    _say("writing chapters")
     replies = {c.slug: run_chapter(c, i, chapters, catalog, snap, commands, runner)
                for i, c in enumerate(chapters, 1)}
+    _say("writing the index")
     index_reply = run_index(chapters, replies, graph, readme, runner)
     # 4. Render, validate, publish (an exception mid-publish is recovered before it propagates)
+    _say("rendering the book")
     files = render_book(chapters, replies, index_reply, snap, graph, catalog, exclusions, disc,
                         git_info(root, disc.included), runner.stats, backend, probe_result, run_id,
                         files_changed=changed_since_snapshot(disc, snap))
     if bad := validate_staging(files, chapters):
         _err("staging validation failed: " + "; ".join(bad[:10]))
         return EXIT_FAIL
+    _say(f"publishing {RENDER_DIR}")
     try:
         publish(root, state, run_id, files)
     except BaseException:
