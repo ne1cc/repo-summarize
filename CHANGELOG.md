@@ -13,6 +13,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 - Output post-pass that fences Mermaid the model left untagged, tagged `text`/`mmd`, tagged with the diagram keyword (e.g. ```` ```sequenceDiagram ````), or unfenced, as ```` ```mermaid ````. Code fences in real languages are untouched.
 
+### Fixed
+- A probe the backend cannot complete (non-zero exit, e.g. exit 126, or a timeout) now stops the run with exit 1 and is not cached. Before, a failed probe was recorded as a clean pass and the run went on to fail three catalog calls with a misleading "cannot execute the backend command inside the sandbox".
+- Non-zero backend call failures now include the first stderr line in the logged reason, so `exit 126`-style failures are diagnosable without re-running with a debugger.
+
 ## [2.0.0] - 2026-10-21
 
 ### Added

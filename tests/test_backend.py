@@ -81,6 +81,9 @@ def test_timeout_and_failures(rs, backend):
         ({"sleep": 3, "chapter": "late"}, "timeout"),
         ({"exit_code": 1}, "exit 1"),
         ({"exit_code": 126}, "exit 126: cannot execute the backend command inside the sandbox"),
+        ({"exit_code": 126, "stderr": "fork failed"},
+         "exit 126: cannot execute the backend command inside the sandbox (stderr: fork failed)"),
+        ({"exit_code": 3, "stderr": "connection reset by peer\nretrying"}, "exit 3 (stderr: connection reset by peer)"),
         ({"stderr": "write_file auto-denied", "chapter": "x"}, "tool-denied"),
         ({"stderr": "Please authenticate first", "exit_code": 1}, "auth"),
         ({"stderr": "Error: Not logged in"}, "auth"),
@@ -213,8 +216,35 @@ def test_probe_no_access_observed(rs, backend, tmp_path):
     assert not list(tmp_path.glob(".repo-summarize-probe-*"))
     b, _ = backend({"probe": "x", "stderr": "write_file auto-denied"})
     assert rs.probe(b, tmp_path) == "probe-no-access-observed"
+
+
+def test_probe_backend_failed(rs, backend, tmp_path):
+    """A probe where the backend never completed is a failure, not a clean pass."""
     b, _ = backend({"probe": "tok-1", "sleep": 3}, REPO_SUMMARIZE_TIMEOUT="1")
+    assert rs.probe(b, tmp_path, token="tok-1") == "probe-backend-failed: timeout"
+    b, _ = backend({"exit_code": 126})
+    assert rs.probe(b, tmp_path, token="tok-1") == "probe-backend-failed: exit 126"
+    # A backend that runs (exit 0) but doesn't answer the probe is not a failure.
+    b, _ = backend({"probe": "  \n"})
     assert rs.probe(b, tmp_path, token="tok-1") == "probe-no-access-observed"
+
+
+def test_probe_failure_not_cached(rs, backend, tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    state.mkdir()
+    b, _ = backend({"exit_code": 126})
+    assert rs._probe_once(b, state).startswith("probe-backend-failed")
+    assert not (state / "probe.json").exists()
+    b2, _ = backend({"probe": "nope"})
+    assert rs._probe_once(b2, state) == "probe-no-access-observed"
+    rec = json.loads((state / "probe.json").read_text())
+    assert rec["result"] == "probe-no-access-observed" and rec["fingerprint"] == b2.fingerprint
+    # Same fingerprint is served from the cache; an access-observed result never is.
+    assert rs._probe_once(b2, state) == "probe-no-access-observed"
+    b3, _ = backend({}, REPO_SUMMARIZE_CACHE_NAMESPACE="ns3")
+    monkeypatch.setattr(rs, "probe", lambda b, home, token=None: "probe-access-observed")
+    assert rs._probe_once(b3, state) == "probe-access-observed"
+    assert not (state / "probe.json").exists()
 
 
 def test_allow_rules_reported(rs, backend, tmp_path, monkeypatch):

@@ -446,6 +446,10 @@ class BackendMissing(Exception):
     pass
 
 
+class BackendFailed(Exception):
+    pass
+
+
 class CallFailed(Exception):
     def __init__(self, reason: str):
         super().__init__(reason)
@@ -577,16 +581,25 @@ def call(b: Backend, prompt: str) -> str:
     if re.search(r"not logged in|authenticate", r.stderr, re.I):
         raise CallFailed("auth")
     if r.returncode in (126, 127):  # e.g. a wrapper script under a sandbox-denied path
-        raise CallFailed(f"exit {r.returncode}: cannot execute the backend command inside the sandbox")
-    if r.returncode:
-        raise CallFailed(f"exit {r.returncode}")
+        base = "exit {0}: cannot execute the backend command inside the sandbox".format(r.returncode)
+    elif r.returncode:
+        base = f"exit {r.returncode}"
+    else:
+        base = None
+    if base:
+        err = r.stderr.strip().splitlines()
+        raise CallFailed(base + (f" (stderr: {err[0][:200]})" if err else ""))
     if not r.stdout.strip():
         raise CallFailed("empty")
     return r.stdout
 
 
 def probe(b: Backend, home: Path, token: str | None = None) -> str:
-    """Regression check: ask the backend to read a sentinel under home and write a canary."""
+    """Regression check: ask the backend to read a sentinel under home and write a canary.
+
+    Returns "probe-access-observed" on a leak or canary, "probe-no-access-observed" when the
+    backend completed without access, or "probe-backend-failed: <reason>" when it never completed.
+    """
     token = token or secrets.token_hex(16)
     sdir = home / f".repo-summarize-probe-{secrets.token_hex(6)}"
     run_dir = tempfile.mkdtemp(prefix="repo-summarize-probe-")
@@ -598,12 +611,16 @@ def probe(b: Backend, home: Path, token: str | None = None) -> str:
                   "Then create a file named canary in your current directory.")
         try:
             r = _run(b, prompt, run_dir)
-            # Exit code and denials don't matter: agy may print the token and then fail on the canary write.
+            # Exit code and denials don't matter for access: agy may print the token and then fail
+            # on the canary write.
             leaked = token in r.stdout or token in r.stderr
         except subprocess.TimeoutExpired:
-            leaked = False
-        seen = leaked or (Path(run_dir) / "canary").exists()
-        return "probe-access-observed" if seen else "probe-no-access-observed"
+            return "probe-backend-failed: timeout"
+        if leaked or (Path(run_dir) / "canary").exists():
+            return "probe-access-observed"
+        if r.returncode:
+            return f"probe-backend-failed: exit {r.returncode}"
+        return "probe-no-access-observed"
     finally:
         shutil.rmtree(sdir, ignore_errors=True)
         shutil.rmtree(run_dir, ignore_errors=True)
@@ -2318,7 +2335,8 @@ def _status(root: Path, state: Path, action: str | None) -> int:
 
 
 def _probe_once(b: Backend, state: Path) -> str:
-    """The probe result for this backend fingerprint; probes when the fingerprint changed or access was seen."""
+    """The probe result for this backend fingerprint; probes when the fingerprint changed,
+    access was seen, or the backend failed. Only a completed clean probe is cached."""
     rec_path = state / "probe.json"
     try:
         rec = json.loads(rec_path.read_text())
@@ -2327,8 +2345,8 @@ def _probe_once(b: Backend, state: Path) -> str:
     except (OSError, ValueError, KeyError, TypeError):
         pass
     result = probe(b, Path.home())
-    if result == "probe-access-observed":  # not cached: the next run probes again once the sandbox is fixed
-        rec_path.unlink(missing_ok=True)
+    if result == "probe-access-observed" or result.startswith("probe-backend-failed"):
+        rec_path.unlink(missing_ok=True)  # not cached: re-probe next run
     else:
         rec_path.write_text(json.dumps({"fingerprint": b.fingerprint, "result": result}))
     return result
@@ -2345,6 +2363,9 @@ def _build(opts: Options, root: Path, state: Path, run_dir: Path, run_id: str) -
     if probe_result == "probe-access-observed" and backend.sandbox != "none":
         raise BackendUnsafe("the sandbox let the backend read a file under $HOME; the run was stopped "
                             "and nothing was published")
+    if probe_result.startswith("probe-backend-failed"):
+        raise BackendFailed(f"the backend could not complete the sandbox probe ({probe_result}); "
+                            "the run was stopped and nothing was published")
     runner = Runner(backend, state, opts.max_calls, opts.force, log_path=run_dir / "log.jsonl")
     # 2. Catalog, plan (persisted unless reused or fallback, so the model gets another chance), attach
     readme = "\n".join(read_snapshot(snap, "README.md")) if "README.md" in disc.included else ""
@@ -2426,6 +2447,9 @@ def run_pipeline(opts: Options) -> int:
         return _build(opts, root, state, run_dir, run_id)
     except BackendMissing as e:
         _err(f"{e} (set REPO_SUMMARIZE_CMD)")
+        return EXIT_FAIL
+    except BackendFailed as e:
+        _err(f"backend failed: {e}")
         return EXIT_FAIL
     except BackendUnsafe as e:
         _err(f"backend unsafe: {e}")
