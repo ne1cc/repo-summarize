@@ -37,6 +37,17 @@ def test_cache_hit_no_call(rs, mk, tmp_path):
     assert stat.S_IMODE(files[0].parent.stat().st_mode) == 0o700
 
 
+def test_call_progress_lines_and_log_secs(rs, mk, tmp_path, capsys):
+    r, _ = mk({"chapter": "hello"}, max_calls=5, log_path=tmp_path / "log.jsonl")
+    r.ask("chapter", "STAGE: chapter\nx")
+    r.ask("chapter", "STAGE: chapter\nx")  # cache hit: no lines
+    err = capsys.readouterr().err
+    assert err.count("chapter: call 1/5 started (0 cached so far)") == 1
+    assert err.count("chapter: call 1/5 done in ") == 1 and "call 2" not in err
+    rows = [json.loads(ln) for ln in (tmp_path / "log.jsonl").read_text().splitlines()]
+    assert isinstance(rows[0]["secs"], float) and rows[1]["secs"] is None
+
+
 def test_key_includes_fingerprint(rs, mk, tmp_path):
     r1, log = mk({"chapter": "a"}, version="v1")
     r1.ask("chapter", "STAGE: chapter\nx")
