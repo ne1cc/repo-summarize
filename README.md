@@ -69,6 +69,8 @@ repo-summarize [path]     build and publish the book
 
 **Wrappers and symlinks.** The sandbox checks the resolved path, not the path you typed. A wrapper such as `~/.local/bin/mywrap -> ~/Github/dotfiles/bin/mywrap` is allowed by name but its target is under `$HOME`, so every call fails with `exit 126: cannot execute the backend command inside the sandbox` and the run aborts after 3 failures. Point `REPO_SUMMARIZE_CMD` at a real file under `~/.local` or outside `$HOME`, or use the default. A wrapper that adds `--dangerously-skip-permissions` hides the flag from the yolo check, so the tool's safety model no longer applies.
 
+**Progress.** Stage lines go to stderr (`cataloging files`, `planning chapters`, ...). Inside a stage, each backend call prints `<stage>: call N[/cap] started (H cached so far)` and then `done in Xs` or `failed after Xs: <reason>`; cached replies print nothing. Each call also writes a `secs` field to `docs/.repo-summarize/runs/<run_id>/log.jsonl`, which you can `tail -f` from another terminal.
+
 Exit codes: 0 published, 1 failed, 2 usage, 3 aborted (3 consecutive call failures), 4 capped by `--max-calls`, 5 backend unsafe.
 
 Private state lives in `docs/.repo-summarize/` (mode 0700, contains a `.gitignore` of `*`, so it is never committed). The published book `docs/architecture/` is also left in the target repo on purpose: commit it, or add `docs/architecture/` to that repo's `.gitignore` if you don't want it in version control. Snapshots are deleted at the end of each run, cached replies are 0600, and logs hold sizes, hashes and labels, never prompt or reply bodies. The last 3 run logs are kept.

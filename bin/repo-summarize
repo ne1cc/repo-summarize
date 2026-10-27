@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import traceback
 from collections import Counter
@@ -670,12 +671,12 @@ class Runner:
         head = f"{stage}:{STAGE_VERSIONS[stage]}\0{self.backend.fingerprint}\0"
         return hashlib.sha256(head.encode() + prompt.encode()).hexdigest()
 
-    def _log(self, stage, key, prompt, reply, cached, ok, reason):
+    def _log(self, stage, key, prompt, reply, cached, ok, reason, secs=None):
         if self.log_path:
             with open(self.log_path, "a") as f:  # sizes only, never bodies
                 f.write(json.dumps({"stage": stage, "key": key[:12], "bytes_in": len(prompt.encode()),
                                     "bytes_out": len(reply.encode()), "cached": cached, "ok": ok,
-                                    "reason": reason}) + "\n")
+                                    "reason": reason, "secs": secs}) + "\n")
 
     def _store(self, path: Path, reply: str) -> None:
         self.cache.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -698,22 +699,31 @@ class Runner:
         self._calls += 1
         by = self.stats["calls_by_stage"]
         by[stage] = by.get(stage, 0) + 1
+        cap = f"/{self.max_calls}" if self.max_calls is not None else ""
+        hits = sum(self.stats["cache_hits_by_stage"].values())
+        label = f"{stage}: call {self._calls}{cap}"
+        _say(f"  {label} started ({hits} cached so far)")
+        t0 = time.monotonic()
         try:
             reply = call(self.backend, prompt)
         except CallFailed as e:
+            secs = round(time.monotonic() - t0, 1)
+            _say(f"  {label} failed after {secs}s: {e.reason}")
             if e.reason == "tool-denied":  # nondeterministic model behavior: own, looser breaker
                 self._denied += 1
             else:
                 self._fails += 1
-            self._log(stage, key, prompt, "", False, False, e.reason)
+            self._log(stage, key, prompt, "", False, False, e.reason, secs)
             if self._denied >= TOOL_DENIED_BREAKER:
                 raise Aborted(f"the backend keeps trying to use tools ({TOOL_DENIED_BREAKER} consecutive denials)") from e
             if self._fails >= BREAKER:
                 raise Aborted(f"{BREAKER} consecutive backend failures (last: {e.reason})") from e
             raise
         self._fails = self._denied = 0
+        secs = round(time.monotonic() - t0, 1)
+        _say(f"  {label} done in {secs}s")
         self._store(path, reply)
-        self._log(stage, key, prompt, reply, False, True, None)
+        self._log(stage, key, prompt, reply, False, True, None, secs)
         return reply
 
     def ask_json(self, stage: str, prompt: str):
