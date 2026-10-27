@@ -67,6 +67,8 @@ repo-summarize [path]     build and publish the book
 
 **Picking a backend.** The default works with agy, so `REPO_SUMMARIZE_CMD` is optional. To use another print-mode CLI, export it in your shell profile, for example `export REPO_SUMMARIZE_CMD="claude -p"` in `~/.zshrc`. If a run says `backend command not found: <cmd>`, the variable holds a stale value: shells that were already open keep what they had before you edited the profile. Run `unset REPO_SUMMARIZE_CMD` in those, or just open a new terminal.
 
+**Wrappers and symlinks.** The sandbox checks the resolved path, not the path you typed. A wrapper such as `~/.local/bin/mywrap -> ~/Github/dotfiles/bin/mywrap` is allowed by name but its target is under `$HOME`, so every call fails with `exit 126: cannot execute the backend command inside the sandbox` and the run aborts after 3 failures. Point `REPO_SUMMARIZE_CMD` at a real file under `~/.local` or outside `$HOME`, or use the default. A wrapper that adds `--dangerously-skip-permissions` hides the flag from the yolo check, so the tool's safety model no longer applies.
+
 Exit codes: 0 published, 1 failed, 2 usage, 3 aborted (3 consecutive call failures), 4 capped by `--max-calls`, 5 backend unsafe.
 
 Private state lives in `docs/.repo-summarize/` (mode 0700, contains a `.gitignore` of `*`, so it is never committed). The published book `docs/architecture/` is also left in the target repo on purpose: commit it, or add `docs/architecture/` to that repo's `.gitignore` if you don't want it in version control. Snapshots are deleted at the end of each run, cached replies are 0600, and logs hold sizes, hashes and labels, never prompt or reply bodies. The last 3 run logs are kept.
